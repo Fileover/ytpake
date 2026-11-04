@@ -290,6 +290,14 @@ pub fn run_app() {
     }
 
     let (pake_config, tauri_config) = get_pake_config();
+
+    // A tabbed build runs its own shell: one native window that hosts a tab
+    // strip webview plus one content webview per tab, instead of Pake's
+    // single-webview window.
+    if pake_config.tabs {
+        app::tabs::run_tabbed(pake_config, tauri_config);
+        return;
+    }
     // A runtime app sets the shell's AppUserModelID to its identifier so
     // shortcuts and toasts group with its windows; CLI apps keep the default.
     #[cfg(windows)]

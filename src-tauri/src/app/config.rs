@@ -130,6 +130,10 @@ pub struct PakeConfig {
     pub multi_instance: bool,
     #[serde(default)]
     pub multi_window: bool,
+    /// Enables the tabbed shell: a single window hosting a tab strip webview
+    /// and one content webview per tab.
+    #[serde(default)]
+    pub tabs: bool,
     /// Replaces the compiled custom.js when a runtime override supplies one.
     #[serde(skip)]
     pub runtime_custom_js: Option<String>,

@@ -1,20 +1,32 @@
 {
-  "productName": "Weekly",
-  "identifier": "com.pake.weekly",
-  "version": "3.17.8",
+  "productName": "YouTube",
+  "mainBinaryName": "YouTube",
+  "identifier": "com.pake.youtube.tabs",
+  "version": "1.0.0",
   "app": {
     "withGlobalTauri": true,
-    "trayIcon": {
-      "iconPath": "png/weekly_512.png",
-      "iconAsTemplate": false,
-      "id": "pake-tray"
-    },
     "security": {
       "headers": {},
       "csp": null
     }
   },
   "build": {
-    "frontendDist": "../dist"
+    "frontendDist": "../ui"
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "nsis"
+    ],
+    "icon": [
+      "png/youtube_256.ico",
+      "png/youtube_32.ico",
+      "png/youtube_512.png"
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    }
   }
 }

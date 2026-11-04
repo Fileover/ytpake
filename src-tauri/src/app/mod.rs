@@ -3,6 +3,7 @@ pub mod auth;
 #[cfg(any(target_os = "linux", test))]
 pub mod color_scheme;
 pub mod config;
+pub mod extensions;
 #[cfg(target_os = "windows")]
 pub mod download;
 pub mod invoke;
@@ -10,7 +11,9 @@ pub mod invoke;
 pub mod menu;
 pub mod navigation;
 pub mod notification;
+pub mod profile;
 pub mod setup;
 #[cfg(target_os = "macos")]
 pub mod tab_bar;
+pub mod tabs;
 pub mod window;

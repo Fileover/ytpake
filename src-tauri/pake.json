@@ -1,29 +1,35 @@
 {
   "windows": [
     {
-      "url": "https://weekly.tw93.fun/en",
+      "url": "https://www.youtube.com",
       "url_type": "web",
-      "hide_title_bar": true,
+      "hide_title_bar": false,
       "hide_window_decorations": false,
       "fullscreen": false,
-      "width": 1200,
-      "height": 780,
+      "maximize": false,
+      "width": 1440,
+      "height": 900,
       "resizable": true,
       "always_on_top": false,
-      "dark_mode": false,
+      "dark_mode": true,
       "activation_shortcut": "",
       "disabled_web_shortcuts": false,
-      "hide_on_close": true,
+      "hide_on_close": false,
       "incognito": false,
-      "password_autosave": false,
+      "restore_last_url": false,
+      "password_autosave": true,
+      "title": "YouTube",
       "enable_wasm": false,
-      "enable_drag_drop": false,
-      "maximize": false,
+      "enable_drag_drop": true,
+      "new_window": false,
       "start_to_tray": false,
       "force_internal_navigation": false,
       "internal_url_regex": "",
       "enable_find": false,
-      "new_window": false
+      "zoom": 100,
+      "min_width": 640,
+      "min_height": 480,
+      "ignore_certificate_errors": false
     }
   ],
   "user_agent": {
@@ -33,13 +39,13 @@
   },
   "system_tray": {
     "macos": false,
-    "linux": true,
-    "windows": true
+    "linux": false,
+    "windows": false
   },
   "system_tray_path": "icons/icon.png",
-  "inject": [],
   "proxy_url": "",
   "download_dir": "",
   "multi_instance": false,
-  "multi_window": false
+  "multi_window": false,
+  "tabs": true
 }
