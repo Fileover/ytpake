@@ -23,13 +23,16 @@ use tauri::{
     AppHandle, Config, Emitter, Manager, PhysicalPosition, PhysicalSize, Position, Rect, Size, Url,
     Webview, WebviewUrl, WindowEvent,
 };
+use tauri_plugin_opener::OpenerExt;
 
 use crate::app::config::PakeConfig;
 use crate::app::extensions::{self, ExtensionInfo};
+use crate::app::filters;
 use crate::app::profile::{
-    extensions_disabled, requested as requested_profile, resolve as resolve_profile,
-    DEFAULT_PROFILE,
+    adblock_enabled, extensions_disabled, requested as requested_profile,
+    resolve as resolve_profile, DEFAULT_PROFILE,
 };
+use crate::app::youtube;
 
 /// Label of the native window that hosts every webview.
 pub const WINDOW_LABEL: &str = "pake";
@@ -39,7 +42,7 @@ pub const CHROME_LABEL: &str = "pake-chrome";
 const CHROME_HEIGHT: f64 = 40.0;
 /// Injected into every content webview before the page's own scripts run.
 const BRIDGE_JS: &str = include_str!("../inject/tab_bridge.js");
-const HIDE_ADS_JS: &str = include_str!("../inject/hide_ads.js");
+const ADBLOCK_JS: &str = include_str!("../inject/adblock.js");
 
 /// The path of the throwaway document a tab shows before its real address.
 /// A 404 is the cheapest HTML any site will serve, and it is never the address
@@ -56,6 +59,11 @@ const STALL_ATTEMPTS: u32 = 5;
 
 /// True while the active page holds an HTML fullscreen element.
 static FULLSCREEN: AtomicBool = AtomicBool::new(false);
+
+/// WebView2 can refuse a whole extension folder. Retrying every new tab with
+/// the same folder only reproduces the failure, so remember it for the session;
+/// the built-in ad blocker keeps working either way.
+static EXTENSION_LOAD_FAILED: AtomicBool = AtomicBool::new(false);
 
 /// The last address a new-window request asked for, with the moment it arrived.
 ///
@@ -131,6 +139,9 @@ pub struct TabManager {
     /// Cached settings-page list. WebView2 only records an extension id once it
     /// has loaded, so the cache is refreshed on demand.
     extensions: Mutex<Vec<ExtensionInfo>>,
+    /// Runtime filter catalogue, injected into every tab before `adblock.js`.
+    /// Loaded once at startup so replacing the JSON only needs a restart.
+    pub filter_script: String,
 }
 
 impl TabManager {
@@ -140,6 +151,7 @@ impl TabManager {
         session_path: Option<PathBuf>,
         extensions_dir: Option<PathBuf>,
         profile_id: u32,
+        filter_script: String,
     ) -> Self {
         Self {
             state: Mutex::new(Tabs::default()),
@@ -149,6 +161,7 @@ impl TabManager {
             extensions_dir,
             profile_id,
             extensions: Mutex::new(Vec::new()),
+            filter_script,
         }
     }
 
@@ -208,14 +221,6 @@ impl TabManager {
         self.lock().active
     }
 
-    fn home_url(&self) -> String {
-        self.config
-            .windows
-            .first()
-            .map(|window| window.url.clone())
-            .unwrap_or_else(|| "https://www.youtube.com".to_string())
-    }
-
     fn user_agent(&self) -> String {
         self.config.user_agent.get().clone()
     }
@@ -250,21 +255,24 @@ fn parse_tab_id(label: &str) -> Option<u32> {
     label.strip_prefix("pake-tab-")?.parse().ok()
 }
 
-fn parse_url(raw: &str, fallback: &str) -> Url {
-    let trimmed = raw.trim();
-    let candidate = if trimmed.is_empty() {
-        fallback
-    } else if trimmed.contains("://") {
-        trimmed
-    } else {
-        // A bare "youtube.com/watch?v=…" is a URL the user meant to visit.
-        return Url::parse(&format!("https://{trimmed}"))
-            .or_else(|_| Url::parse(fallback))
-            .unwrap_or_else(|_| Url::parse("https://www.youtube.com").expect("static URL"));
-    };
-    Url::parse(candidate)
-        .or_else(|_| Url::parse(fallback))
-        .unwrap_or_else(|_| Url::parse("https://www.youtube.com").expect("static URL"))
+/// Open a link that points outside YouTube in the user's default browser.
+///
+/// The shell itself stays YouTube-only; the system browser is the right place
+/// for a channel's website, a support page or any other external link.
+fn open_external(app: &AppHandle, url: &Url) {
+    if !matches!(url.scheme(), "http" | "https") {
+        return;
+    }
+    let handle = app.clone();
+    let href = url.to_string();
+    std::thread::spawn(move || {
+        trace(&format!(
+            "link: {href} is outside YouTube, opening externally"
+        ));
+        if let Err(error) = handle.opener().open_url(href.as_str(), None::<&str>) {
+            trace(&format!("link: could not open {href}: {error}"));
+        }
+    });
 }
 
 /// Resize the tab strip and every content webview to match the window.
@@ -364,7 +372,9 @@ fn resume_target(app: &AppHandle, id: u32, webview: &Webview) {
     let Ok(url) = Url::parse(&target) else {
         return;
     };
-    trace(&format!("tab {id}: shown without a page, resuming at the destination"));
+    trace(&format!(
+        "tab {id}: shown without a page, resuming at the destination"
+    ));
     let _ = webview.navigate(url);
 }
 
@@ -381,14 +391,23 @@ fn build_webview(
     let label = tab_label(id);
     let user_agent = manager.user_agent();
     let data_dir = manager.data_dir.clone();
-    let extensions = manager
-        .extensions_dir
-        .clone()
-        .filter(|directory| allow_extensions && !extensions_disabled() && extensions::has_extensions(directory));
+    let extensions = manager.extensions_dir.clone().filter(|directory| {
+        allow_extensions
+            && !extensions_disabled()
+            && !EXTENSION_LOAD_FAILED.load(Ordering::Relaxed)
+            && extensions::has_extensions(directory)
+    });
 
     let title_app = app.clone();
     let load_app = app.clone();
     let popup_app = app.clone();
+    let navigation_app = app.clone();
+    let adblock_flag = if adblock_enabled() {
+        "window.__YTPAKE_ADBLOCK_ENABLED__ = true;"
+    } else {
+        "window.__YTPAKE_ADBLOCK_ENABLED__ = false;"
+    };
+    let filter_script = manager.filter_script.clone();
 
     // WebView2 only hands extension content scripts to a renderer that already
     // exists, so the very first page of a new webview runs without them: the
@@ -397,21 +416,19 @@ fn build_webview(
     // the renderer up, and replacing it with the real address then gets the
     // scripts at document_start. Only tabs with extensions pay for the hop.
     let start = match extensions.is_some() {
-        true => {
-            match warmup_url(&url) {
-                Some(warmup) => {
-                    manager.lock().pending.insert(
-                        id,
-                        Pending {
-                            target: url.clone(),
-                            dispatched: false,
-                        },
-                    );
-                    warmup
-                }
-                None => url,
+        true => match warmup_url(&url) {
+            Some(warmup) => {
+                manager.lock().pending.insert(
+                    id,
+                    Pending {
+                        target: url.clone(),
+                        dispatched: false,
+                    },
+                );
+                warmup
             }
-        }
+            None => url,
+        },
         false => {
             // The fallback build has no extensions, so it navigates directly
             // and must not leave a pending destination behind.
@@ -426,27 +443,41 @@ fn build_webview(
         // The shell is dark; without this the throwaway document flashes white.
         .background_color(Color(15, 15, 15, 255))
         .initialization_script(BRIDGE_JS)
-        // The extensions' own cosmetic filtering does nothing in WebView2, so
-        // the ad slots YouTube renders into the page are hidden here.
-        .initialization_script(HIDE_ADS_JS)
-        .on_navigation(|_url| true)
+        // The built-in blocker runs before YouTube's own scripts and does not
+        // depend on an extension being installed. Extensions are a second,
+        // optional layer on top of it.
+        .initialization_script(adblock_flag)
+        .initialization_script(filter_script.as_str())
+        .initialization_script(ADBLOCK_JS)
+        // This shell is YouTube-only. A page that tries to navigate anywhere
+        // else is denied and the link is handed to the system browser instead.
+        .on_navigation(move |url| {
+            if youtube::allows_navigation(url) {
+                return true;
+            }
+            open_external(&navigation_app, url);
+            false
+        })
         .on_new_window(move |url, _features| {
-            // Sites open links with window.open; a tab is a better home for
-            // them than a separate native window. The closure runs off the
-            // main thread on Windows, so spawning a tab here is safe.
-            // Only real page URLs qualify: a bare about:blank is a pre-created
-            // popup, and tabbing it would duplicate the current page.
-            if matches!(url.scheme(), "http" | "https") {
-                let target = url.to_string();
-                if !popup_is_duplicate(&target) {
-                    let app = popup_app.clone();
-                    // In the background: the page the user is on keeps the
-                    // focus, the way a middle click behaves in a browser. The
-                    // tab loads while it is out of sight.
-                    std::thread::spawn(move || {
-                        let _ = open_tab(&app, Some(target), false);
-                    });
-                }
+            // Sites open links with window.open; a YouTube link becomes a new
+            // tab, an external one goes to the system browser. The closure
+            // runs off the main thread on Windows, so spawning a tab is safe.
+            if !matches!(url.scheme(), "http" | "https") {
+                return NewWindowResponse::Deny;
+            }
+            if !youtube::is_youtube_target(&url) {
+                open_external(&popup_app, &url);
+                return NewWindowResponse::Deny;
+            }
+            let target = url.to_string();
+            if !popup_is_duplicate(&target) {
+                let app = popup_app.clone();
+                // In the background: the page the user is on keeps the
+                // focus, the way a middle click behaves in a browser. The
+                // tab loads while it is out of sight.
+                std::thread::spawn(move || {
+                    let _ = open_tab(&app, Some(target), false);
+                });
             }
             NewWindowResponse::Deny
         })
@@ -604,7 +635,9 @@ static LAST_CREATE: Mutex<Option<Instant>> = Mutex::new(None);
 ///
 /// The lock is held across the wait, which is what serializes the callers.
 fn wait_for_creation_slot() {
-    let mut last = LAST_CREATE.lock().unwrap_or_else(|error| error.into_inner());
+    let mut last = LAST_CREATE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     if let Some(at) = *last {
         let elapsed = at.elapsed();
         if elapsed < TAB_SPACING {
@@ -705,8 +738,7 @@ pub async fn tabs_extension_menu(app: AppHandle) -> Result<(), String> {
 /// at once while the webviews are built one at a time behind them.
 fn reserve_tab(app: &AppHandle, url: Option<&str>, activate: bool) -> (u32, Url) {
     let manager = app.state::<TabManager>();
-    let home = manager.home_url();
-    let target = parse_url(url.unwrap_or(&home), &home);
+    let target = youtube::target(url.unwrap_or(youtube::HOME));
 
     let id = {
         let mut state = manager.lock();
@@ -737,7 +769,8 @@ fn create_webview(app: &AppHandle, id: u32, target: Url) -> Result<(), String> {
     // the tab is retried without extensions and they stay off for the session.
     let mut built = build_webview(app, id, target.clone(), strip, width, height, true);
     if built.is_err() && !extensions_disabled() {
-        trace("extension loading failed; opening this tab without extensions");
+        trace("extension loading failed; opening tabs without extensions for this session");
+        EXTENSION_LOAD_FAILED.store(true, Ordering::Relaxed);
         built = build_webview(app, id, target.clone(), strip, width, height, false);
     }
     if let Err(error) = built {
@@ -1062,10 +1095,9 @@ fn ensure_webview(app: &AppHandle, id: u32) -> bool {
 
     let target = {
         let manager = app.state::<TabManager>();
-        let home = manager.home_url();
         let state = manager.lock();
         match state.items.iter().find(|tab| tab.id == id) {
-            Some(tab) => parse_url(&tab.url, &home),
+            Some(tab) => youtube::target(&tab.url),
             None => return false,
         }
     };
@@ -1124,7 +1156,9 @@ pub fn close_tab(app: &AppHandle, id: u32) -> Result<(), String> {
         state.pending.remove(&id);
         let was_active = state.active == Some(id);
         if was_active {
-            let next = index.saturating_sub(1).min(state.items.len().saturating_sub(1));
+            let next = index
+                .saturating_sub(1)
+                .min(state.items.len().saturating_sub(1));
             state.active = state.items.get(next).map(|tab| tab.id);
         }
         (state.items.len(), was_active)
@@ -1312,11 +1346,24 @@ pub async fn tabs_cycle(app: AppHandle, delta: i32) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn tabs_navigate(app: AppHandle, url: String) -> Result<(), String> {
-    let manager = app.state::<TabManager>();
-    let home = manager.home_url();
-    let target = parse_url(&url, &home);
+    let target = youtube::target(&url);
     let webview = active_webview(&app).ok_or_else(|| "nenhuma aba ativa".to_string())?;
     webview.navigate(target).map_err(|error| error.to_string())
+}
+
+/// Open an external link in the system browser, never inside a tab.
+///
+/// The page-side bridge calls this for links outside the YouTube allowlist;
+/// the shell itself stays a single-site application.
+#[tauri::command]
+pub async fn tabs_open_external(app: AppHandle, url: String) -> Result<(), String> {
+    let target = Url::parse(&url).map_err(|error| error.to_string())?;
+    if !matches!(target.scheme(), "http" | "https") || youtube::allows_navigation(&target) {
+        return Err("external link expected".into());
+    }
+    app.opener()
+        .open_url(target.as_str(), None::<&str>)
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -1328,7 +1375,9 @@ pub async fn tabs_reload(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub async fn tabs_back(app: AppHandle) -> Result<(), String> {
     let webview = active_webview(&app).ok_or_else(|| "nenhuma aba ativa".to_string())?;
-    webview.eval("history.back()").map_err(|error| error.to_string())
+    webview
+        .eval("history.back()")
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -1546,6 +1595,7 @@ pub fn run_tabbed(pake_config: PakeConfig, tauri_config: Config) {
             tabs_state,
             tabs_fullscreen,
             tabs_extension_menu,
+            tabs_open_external,
         ])
         .on_menu_event(|app, event| {
             // Native popup menu built on demand by `tabs_extension_menu`.
@@ -1577,12 +1627,19 @@ pub fn run_tabbed(pake_config: PakeConfig, tauri_config: Config) {
             // Settings pages have to be embeddable before the browser reads
             // the manifests, so this runs ahead of `create_shell`.
             extensions::prepare(&profile.extensions);
-            trace("setup: extensions prepared");
+            extensions::log_discovered(&profile.extensions);
+            trace(&format!(
+                "setup: extensions folder {}",
+                profile.extensions.display()
+            ));
 
             let data_dir = profile.webview_dir();
             let session_path = Some(profile.session_path());
             // One folder beside the executable serves every profile.
             let extensions_dir = Some(profile.extensions.clone());
+            // Filters are read once here, not per tab: a replaced JSON takes
+            // effect on the next launch for every tab in the window.
+            let filter_script = filters::initialization_script(&profile.base);
 
             app.manage(TabManager::new(
                 pake_config.clone(),
@@ -1590,6 +1647,7 @@ pub fn run_tabbed(pake_config: PakeConfig, tauri_config: Config) {
                 session_path,
                 extensions_dir,
                 profile.id,
+                filter_script,
             ));
 
             create_shell(&handle)?;

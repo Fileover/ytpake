@@ -1,5 +1,15 @@
 # AGENTS.md - Pake Project Knowledge Base
 
+> **This checkout is the YouTube Desktop fork.** The upstream Pake CLI, gallery
+> and multi-app release workflows are retained only as build tooling and CI
+> coverage. The application that ships from `src-tauri/tauri.conf.json` is
+> YouTube-only: `src-tauri/src/app/youtube.rs` owns the navigation allowlist,
+> `src-tauri/src/inject/adblock.js` is the built-in blocker, and
+> `filters/youtube.json` is its updatable filter catalogue. Extensions in
+> `extensions/` are optional and are never required for ad blocking. Read
+> `README.md` and `docs/architecture.md` before changing those files. Everything
+> below describes upstream Pake and still applies to the retained CLI code.
+
 > Project-specific Rust + Tauri rules: `.claude/rules/rust.md`. Skills live under `.agents/skills/` (`/release`; `.claude/skills/*` are symlinks into `.agents/skills/`, edit the `.agents` copy only). Exception: the `pake` skill's real source is `plugins/pake/skills/pake/SKILL.md` (shipped to users via the Claude Code and Codex plugin marketplaces, `.claude-plugin/marketplace.json` and `.agents/plugins/marketplace.json`); `.agents/skills/pake` is a symlink to it.
 
 ## Project Identity

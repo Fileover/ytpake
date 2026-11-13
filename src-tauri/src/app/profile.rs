@@ -108,7 +108,8 @@ pub fn resolve(app_data: Option<&Path>) -> Profile {
     let id = requested().unwrap_or(DEFAULT_PROFILE);
     let dir = base.join(format!("profile{id}"));
 
-    let extensions = extensions_dir(exe_dir.as_deref(), &base);
+    let extensions =
+        requested_extensions_dir().unwrap_or_else(|| extensions_dir(exe_dir.as_deref(), &base));
 
     let profile = Profile {
         id,
@@ -128,6 +129,44 @@ pub fn resolve(app_data: Option<&Path>) -> Profile {
     let _ = fs::create_dir_all(&profile.extensions);
     profile.adopt_legacy_extensions();
     profile
+}
+
+/// An explicit extension folder, from `YTPAKE_EXTENSIONS_DIR` or
+/// `--extensions-dir <path>`. Useful for testing a downloaded extension
+/// without copying it into the installation directory.
+fn requested_extensions_dir() -> Option<PathBuf> {
+    if let Ok(raw) = std::env::var("YTPAKE_EXTENSIONS_DIR") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
+        }
+    }
+    extensions_dir_from_args(std::env::args().skip(1))
+}
+
+/// Pure argument parser, so the flag can be unit tested without touching the
+/// process command line.
+fn extensions_dir_from_args<I>(args: I) -> Option<PathBuf>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if arg == "--extensions-dir" {
+            if let Some(value) = args.next() {
+                let value = value.trim();
+                if !value.is_empty() {
+                    return Some(PathBuf::from(value));
+                }
+            }
+        } else if let Some(value) = arg.strip_prefix("--extensions-dir=") {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(PathBuf::from(value));
+            }
+        }
+    }
+    None
 }
 
 /// `<exe dir>/extensions`, falling back to `<base>/extensions` when the
@@ -206,7 +245,11 @@ fn exe_dir() -> Option<PathBuf> {
 /// every profile beside the executable instead of into the user's app data.
 pub fn is_portable() -> bool {
     exe_dir()
-        .map(|dir| PORTABLE_MARKERS.iter().any(|marker| dir.join(marker).exists()))
+        .map(|dir| {
+            PORTABLE_MARKERS
+                .iter()
+                .any(|marker| dir.join(marker).exists())
+        })
         .unwrap_or(false)
 }
 
@@ -216,6 +259,15 @@ pub fn extensions_disabled() -> bool {
     std::env::args()
         .skip(1)
         .any(|arg| arg == "--no-extensions" || arg == "--no-ext")
+}
+
+/// The built-in blocker is on by default; `--no-adblock` turns it off without
+/// uninstalling any extension. Useful for comparing behaviour or for sites
+/// that change their markup in a way the filters do not cover yet.
+pub fn adblock_enabled() -> bool {
+    !std::env::args()
+        .skip(1)
+        .any(|arg| arg == "--no-adblock" || arg == "--disable-adblock")
 }
 
 /// The `--profileN` value from the command line, if any.
@@ -255,7 +307,11 @@ fn parse_id(raw: &str) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_id;
+    use super::{extensions_dir_from_args, parse_id};
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
 
     #[test]
     fn accepts_only_the_documented_range() {
@@ -264,5 +320,28 @@ mod tests {
         assert_eq!(parse_id("0"), None);
         assert_eq!(parse_id("100"), None);
         assert_eq!(parse_id("abc"), None);
+    }
+
+    #[test]
+    fn reads_an_explicit_extensions_folder_in_both_flag_forms() {
+        assert_eq!(
+            extensions_dir_from_args(args(&["--profile2", "--extensions-dir", "C:/ext"])),
+            Some(std::path::PathBuf::from("C:/ext"))
+        );
+        assert_eq!(
+            extensions_dir_from_args(args(&["--extensions-dir=C:/ext"])),
+            Some(std::path::PathBuf::from("C:/ext"))
+        );
+    }
+
+    #[test]
+    fn ignores_an_empty_or_missing_extensions_folder() {
+        assert_eq!(extensions_dir_from_args(args(&["--profile2"])), None);
+        assert_eq!(extensions_dir_from_args(args(&["--extensions-dir"])), None);
+        assert_eq!(extensions_dir_from_args(args(&["--extensions-dir="])), None);
+        assert_eq!(
+            extensions_dir_from_args(args(&["--extensions-dir=", "C:/fallback"])),
+            None
+        );
     }
 }

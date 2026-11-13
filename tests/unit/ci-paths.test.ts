@@ -84,7 +84,9 @@ function makeFilter(patterns: string[]) {
   };
 }
 
-const text = fs.readFileSync(WORKFLOW, 'utf8');
+// Workflows are checked out with CRLF on Windows, while the regexes below
+// anchor on \n. Normalise so the filter is evaluated the same way on every OS.
+const text = fs.readFileSync(WORKFLOW, 'utf8').replace(/\r\n/g, '\n');
 const push = eventPaths(text, 'push');
 const included = makeFilter(push);
 const files = execSync('git ls-files', { cwd: ROOT, encoding: 'utf8' })

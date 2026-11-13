@@ -29,18 +29,19 @@ strip and one for the page, and the scripts know where each lives.
 
 ## The scripts
 
-| Script | What it answers |
-| --- | --- |
-| `round.py` | End-to-end: restored tabs, the extension in every tab, a middle click opening exactly one tab in the background. This is the one to run after a change. |
-| `stability.py` | Do tab widths and nodes stay put while a page loads? Reports distinct widths per tab and how many times the strip was rebuilt. |
-| `ad_control.py` | What the page looks like with and without the extensions: `<style>` count, ad slots holding a real ad. Run it twice, once with `off`. |
-| `ad_two_tabs.py` | The same survey across two tabs — the home page first, a watch page second. |
-| `ublock_probe.py` | First load versus a later load: is the extension present, are the ads gone. |
-| `warmup_tune.py` | How short the warm-up wait can be before a tab loses the extension. Takes the delay in milliseconds and the number of tabs. |
-| `title_check.py` | The window caption, read from the operating system, after each tab switch and after closing. |
-| `layout_probe.py`, `click_tab.py` | Tab geometry, and clicking a tab by position. |
-| `cdp.py` | The protocol helper: WebSocket session, `Runtime.evaluate`, input events. |
-| `shot.py` | Screenshot of a window by handle. |
+| Script                            | What it answers                                                                                                                                                                                                                                                                                |
+| --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `round.py`                        | End-to-end: restored tabs, the extension in every tab, a middle click opening exactly one tab in the background. This is the one to run after a change.                                                                                                                                        |
+| `stability.py`                    | Do tab widths and nodes stay put while a page loads? Reports distinct widths per tab and how many times the strip was rebuilt.                                                                                                                                                                 |
+| `ad_control.py`                   | What the page looks like with and without the extensions: `<style>` count, ad slots holding a real ad. Run it twice, once with `off`.                                                                                                                                                          |
+| `ad_two_tabs.py`                  | The same survey across two tabs — the home page first, a watch page second.                                                                                                                                                                                                                    |
+| `ublock_probe.py`                 | First load versus a later load: is the extension present, are the ads gone.                                                                                                                                                                                                                    |
+| `adblock_probe.py`                | Built-in blocker: is it enabled, which filter version/source is active, how many requests/breaks/slots it blocked, and whether any ad slot is still visible. Requires an already-running app with `--remote-debugging-port=9222`; unlike the scripts above it does not launch or kill the app. |
+| `warmup_tune.py`                  | How short the warm-up wait can be before a tab loses the extension. Takes the delay in milliseconds and the number of tabs.                                                                                                                                                                    |
+| `title_check.py`                  | The window caption, read from the operating system, after each tab switch and after closing.                                                                                                                                                                                                   |
+| `layout_probe.py`, `click_tab.py` | Tab geometry, and clicking a tab by position.                                                                                                                                                                                                                                                  |
+| `cdp.py`                          | The protocol helper: WebSocket session, `Runtime.evaluate`, input events.                                                                                                                                                                                                                      |
+| `shot.py`                         | Screenshot of a window by handle.                                                                                                                                                                                                                                                              |
 
 ## Notes on the environment
 

@@ -27,6 +27,7 @@ fn main() {
             "tabs_state",
             "tabs_fullscreen",
             "tabs_extension_menu",
+            "tabs_open_external",
         ]),
     ))
     .expect("Failed to build Pake permissions")

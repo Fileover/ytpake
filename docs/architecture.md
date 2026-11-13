@@ -32,10 +32,10 @@ The strip is a plain HTML page — no framework. It talks to Rust through Tauri'
 Data directories are separate on purpose, so the strip's cache never competes
 with the page's:
 
-| Webview | Profile location |
-| --- | --- |
-| strip | `%LOCALAPPDATA%\com.pake.youtube.tabs\EBWebView` |
-| content | `<base>\profile1\webview\EBWebView` |
+| Webview | Profile location                                 |
+| ------- | ------------------------------------------------ |
+| strip   | `%LOCALAPPDATA%\com.pake.youtube.tabs\EBWebView` |
+| content | `<base>\profile1\webview\EBWebView`              |
 
 `<base>` is the executable's folder when a `portable` marker file sits next to it,
 and `%APPDATA%\com.pake.youtube.tabs` otherwise.
@@ -101,16 +101,16 @@ that threshold was found without rebuilding.
 
 Startup on this machine, before and after the 404 warm-up page:
 
-| Milestone | Home page warm-up | 404 warm-up |
-| --- | --- | --- |
-| Warm-up over | 7424 ms | **5949 ms** |
-| First title | 8021 ms | **6602 ms** |
+| Milestone    | Home page warm-up | 404 warm-up |
+| ------------ | ----------------- | ----------- |
+| Warm-up over | 7424 ms           | **5949 ms** |
+| First title  | 8021 ms           | **6602 ms** |
 
 ## Trap 2 — a navigation to a hidden webview is dropped
 
 Not queued: dropped. A background tab (middle click, or a new tab the strip
 created without activating) could issue its navigation while hidden and then sit
-on the throwaway document for good, because the tab is hidden *because* it is
+on the throwaway document for good, because the tab is hidden _because_ it is
 still warming, and it stops warming only when the real page starts loading.
 
 `apply_active` therefore calls `resume_target()`: when a tab is shown without
@@ -130,25 +130,67 @@ Cosmetic filtering does not work. Elements EasyList hides (`.adsbygoogle`,
 after a reload. `testMatchOutcome` matches rule 5229 of `ublock-filters` for the
 ad script, so the rules are loaded — they simply do not reach the page.
 
-The ads that survive are the ones YouTube renders into the page itself: the feed
-slots, the masthead banner, the column beside the video. There is no request to
-cancel, so the application hides them:
+And an unpacked extension is optional. A clean install has no `extensions/`
+folder at all, so the very first run used to have no blocker whatsoever. Hiding a
+few slots with CSS could not fix either problem.
 
-```js
-// src-tauri/src/inject/hide_ads.js — injected before the page's own scripts
-sheet = new CSSStyleSheet();
-sheet.replaceSync(css);
-document.adoptedStyleSheets = document.adoptedStyleSheets.concat(sheet);
-```
+## The built-in blocker
 
-An **adopted stylesheet**, not a `<style>` element. YouTube rebuilds its own head
-while it boots, and a style element appended at `document_start` does not survive
-that; the adopted sheet belongs to the document and does. The selectors cover the
-feed, search results, the watch sidebar, and the promo slots between sections.
+`src-tauri/src/inject/adblock.js` is injected into every content webview before
+the page's own scripts. It never depends on an extension and works at three
+levels:
 
-The player's own ad UI (`.ytp-ad-module`) is deliberately not hidden. Blocking
-already covers video ads, and hiding the module when one slips through would
-leave a black player with no countdown and no skip button.
+1. **Player data.** `ytInitialPlayerResponse` and `ytInitialData` are written as
+   object literals, not parsed JSON, so they are intercepted with accessor
+   properties on `window`. `JSON.parse`, `Response.prototype.json` and the XHR
+   `responseText` getter are wrapped as well. A recursive scrub removes ad keys
+   (`adPlacements`, `playerAds`, `adSlots`, the ad-slot renderers) from any
+   object, with a depth limit and a `WeakSet` for cycles. Removing the placement
+   is what stops a video ad: with nothing in the player response, no ad break is
+   ever scheduled.
+2. **Network.** `fetch`, `XMLHttpRequest.open` and `navigator.sendBeacon` answer
+   ad requests locally. Blocked fetches get a harmless `Response("{}")`; blocked
+   XHRs are pointed at a `data:` URL so the XHR API still completes. Media from
+   `googlevideo.com`, thumbnails from `ytimg.com` and `youtubei/v1/player` are
+   explicitly excluded from the patterns.
+3. **Page.** A constructed stylesheet is **adopted** rather than appended:
+
+   ```js
+   sheet = new CSSStyleSheet();
+   sheet.replaceSync(css);
+   document.adoptedStyleSheets = document.adoptedStyleSheets.concat(sheet);
+   ```
+
+   YouTube rebuilds its own head while it boots, and a `<style>` element added
+   at `document_start` does not survive that. A throttled `MutationObserver`
+   reapplies the sheet, and a 500 ms watchdog clicks `.ytp-ad-skip-button` or
+   seeks to the end of an ad that still plays.
+
+The player's own ad UI (`.ytp-ad-module`) is deliberately not hidden. If an ad
+does slip through, its countdown and skip button have to stay usable.
+
+`window.__ytpakeAdblock` exposes `stats`, the active filter version/source and
+the pure `scrub()` / `isAdRequest()` helpers for DevTools probes.
+`--no-adblock` turns the whole layer off without touching extensions.
+
+## Runtime filter catalogue
+
+Hard-coding selectors in the injected script would mean recompiling the app every
+time YouTube changes its markup. Instead `filters/youtube.json` holds the keys,
+URL patterns and selectors. `app/filters.rs` reads it at startup, validates its
+shape and injects it as `window.__YTPAKE_ADBLOCK_FILTERS__` **before**
+`adblock.js`. Lookup order, first valid file wins:
+
+1. `--filters <path>` / `YTPAKE_FILTERS_FILE`
+2. `<app data>/filters/youtube.json` (user update)
+3. `<exe dir>/filters/youtube.json` (bundled resource)
+4. the JSON compiled into the binary
+
+An invalid file is skipped with a trace line; the blocker keeps running. A
+malformed regex in the catalogue is caught when `adblock.js` compiles it.
+`pnpm filters:check` rejects a catalogue that would block a player call, a
+thumbnail or a media segment. Updating the filters is therefore replacing a
+JSON file and restarting — see [filters/README.md](../filters/README.md).
 
 ## Window title and fullscreen
 
@@ -181,3 +223,10 @@ autoscroll, the mouse is captured, and the `auxclick` never arrives. Cancelling
 `tools/` holds the scripts used to verify all of this against the running
 application over the DevTools protocol. They expect a built copy in
 `dist/YouTube-portable`; see [tools/README.md](../tools/README.md).
+`tools/adblock_probe.py` is the quick check for the blocker: with the app running
+on `--remote-debugging-port=9222` it reports the active filter version and
+source, the blocked-request/break/slot counters and any ad slot still visible.
+
+The startup trace (`%TEMP%\ytpake-trace.log`) records the navigation policy,
+the extension inventory and which filter catalogue was loaded, so a broken
+extension folder or a malformed `youtube.json` is visible without a debugger.

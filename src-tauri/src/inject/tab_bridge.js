@@ -24,9 +24,36 @@
     }
   }
 
+  // The application is YouTube-only. These are the same origins the Rust
+  // navigation policy accepts; everything else is handed to the system
+  // browser instead of becoming a tab. Keep both lists in sync.
+  var ALLOWED_DOMAINS = [
+    "youtube.com",
+    "youtube-nocookie.com",
+    "youtu.be",
+    "accounts.google.com",
+    "consent.google.com",
+  ];
+
+  function isYoutubeUrl(url) {
+    var host;
+    try {
+      host = new URL(url).hostname.toLowerCase();
+    } catch (error) {
+      return false;
+    }
+    return ALLOWED_DOMAINS.some(function (domain) {
+      return host === domain || host.endsWith("." + domain);
+    });
+  }
+
   function openInTab(href) {
     var url = absolute(href);
     if (!url || !/^https?:/i.test(url)) return false;
+    if (!isYoutubeUrl(url)) {
+      invoke("tabs_open_external", { url: url });
+      return true;
+    }
     invoke("tabs_new", { url: url });
     return true;
   }
@@ -35,7 +62,11 @@
   // a separate native window so the app stays a single window.
   var nativeOpen = window.open;
   window.open = function (url, target, features) {
-    if (typeof url === "string" && url && !/^(about|javascript|data):/i.test(url)) {
+    if (
+      typeof url === "string" &&
+      url &&
+      !/^(about|javascript|data):/i.test(url)
+    ) {
       if (openInTab(url)) return null;
     }
     return nativeOpen.call(window, url, target, features);
@@ -45,10 +76,12 @@
   // retargeted to the custom element. composedPath() still walks the real
   // ancestor chain and finds the anchor.
   function findAnchor(event) {
-    var path = typeof event.composedPath === "function" ? event.composedPath() : [];
+    var path =
+      typeof event.composedPath === "function" ? event.composedPath() : [];
     for (var i = 0; i < path.length; i++) {
       var node = path[i];
-      if (node && node.tagName === "A" && typeof node.href === "string") return node;
+      if (node && node.tagName === "A" && typeof node.href === "string")
+        return node;
     }
     var target = event.target;
     return target && target.closest ? target.closest("a[href]") : null;
@@ -71,7 +104,8 @@
     function (event) {
       var anchor = findAnchor(event);
       if (!anchor) return;
-      var wantsTab = event.ctrlKey || event.metaKey || anchor.target === "_blank";
+      var wantsTab =
+        event.ctrlKey || event.metaKey || anchor.target === "_blank";
       if (!wantsTab) return;
       if (openInTab(anchor.href)) {
         event.preventDefault();
@@ -152,33 +186,50 @@
     const overlay = document.createElement("div");
     overlay.id = "pake-settings-overlay";
     overlay.style.cssText = [
-      "position:fixed", "inset:0", "z-index:2147483647",
-      "background:rgba(0,0,0,0.72)", "display:flex",
-      "align-items:center", "justify-content:center",
+      "position:fixed",
+      "inset:0",
+      "z-index:2147483647",
+      "background:rgba(0,0,0,0.72)",
+      "display:flex",
+      "align-items:center",
+      "justify-content:center",
       "backdrop-filter:blur(2px)",
     ].join(";");
 
     const panel = document.createElement("div");
     panel.style.cssText = [
-      "position:relative", "width:min(1120px,94vw)", "height:88vh",
-      "background:#0f0f0f", "border:1px solid #2a2a2a",
-      "border-radius:12px", "overflow:hidden",
+      "position:relative",
+      "width:min(1120px,94vw)",
+      "height:88vh",
+      "background:#0f0f0f",
+      "border:1px solid #2a2a2a",
+      "border-radius:12px",
+      "overflow:hidden",
       "box-shadow:0 24px 60px rgba(0,0,0,0.6)",
     ].join(";");
 
     const frame = document.createElement("iframe");
     frame.src = url;
-    frame.style.cssText = "width:100%;height:100%;border:0;display:block;background:#0f0f0f";
+    frame.style.cssText =
+      "width:100%;height:100%;border:0;display:block;background:#0f0f0f";
     frame.setAttribute("allow", "clipboard-write");
 
     const close = document.createElement("button");
     close.textContent = "\u00d7";
     close.title = "Fechar (Esc)";
     close.style.cssText = [
-      "position:absolute", "top:8px", "right:10px", "z-index:1",
-      "width:30px", "height:30px", "border:0", "border-radius:8px",
-      "background:rgba(255,255,255,0.08)", "color:#f1f1f1",
-      "font:400 20px/1 system-ui,sans-serif", "cursor:pointer",
+      "position:absolute",
+      "top:8px",
+      "right:10px",
+      "z-index:1",
+      "width:30px",
+      "height:30px",
+      "border:0",
+      "border-radius:8px",
+      "background:rgba(255,255,255,0.08)",
+      "color:#f1f1f1",
+      "font:400 20px/1 system-ui,sans-serif",
+      "cursor:pointer",
     ].join(";");
     close.addEventListener("click", () => overlay.remove());
 
@@ -198,5 +249,4 @@
     overlay.appendChild(panel);
     document.documentElement.appendChild(overlay);
   };
-
 })();

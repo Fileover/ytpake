@@ -1,7 +1,7 @@
 {
   "name": "pake-cli",
   "version": "3.17.8",
-  "description": "Turn any website into a lightweight desktop app with one command. 一键把网站打包成轻量桌面应用。",
+  "description": "YouTube as a desktop application with tabs, a built-in ad blocker and optional browser extensions. A YouTube-only fork of Pake; the upstream CLI is kept as build tooling.",
   "homepage": "https://pake.run",
   "engines": {
     "node": ">=20.9.0"
@@ -38,6 +38,11 @@
   ],
   "scripts": {
     "start": "pnpm run dev",
+    "app:dev": "tauri dev",
+    "app:build": "tauri build --bundles nsis",
+    "extensions:check": "node scripts/check-extensions.mjs",
+    "filters:check": "node scripts/check-filters.mjs",
+    "check": "pnpm filters:check && pnpm extensions:check",
     "dev": "pnpm run tauri dev",
     "build": "tauri build",
     "build:debug": "tauri build --debug",

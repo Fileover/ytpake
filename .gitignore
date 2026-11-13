@@ -49,7 +49,14 @@ yarn-error.log*
 code-review-graph.mmd
 code-review-graph.json
 
+# Unpacked browser extensions are supplied by the user. Keep the folder in the
+# installer without vendoring third-party GPL code into this repository.
+extensions/*
+!extensions/README.md
+
 # Local test artifacts
+__pycache__/
+*.pyc
 test-local.html
 src-tauri/icons/testapp.icns
 src-tauri/icons/localapp.icns

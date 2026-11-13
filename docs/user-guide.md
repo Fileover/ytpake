@@ -4,10 +4,10 @@ This is the readme that ships with the application, in English.
 
 ## Files
 
-| File | What it is |
-| --- | --- |
+| File                          | What it is                              |
+| ----------------------------- | --------------------------------------- |
 | `YouTube_1.0.0_x64-setup.exe` | Installer (Windows x64, NSIS, per-user) |
-| `YouTube-portable\` | Portable build — installs nothing |
+| `YouTube-portable\`           | Portable build — installs nothing       |
 
 ## Portable build
 
@@ -19,7 +19,8 @@ YouTube-portable\
   YouTube.exe
   WebView2Loader.dll
   portable                 portable mode marker
-  extensions\              extensions (shared by every profile)
+  filters\youtube.json     ad filter catalogue (editable, no rebuild needed)
+  extensions\              optional extensions (shared by every profile)
   profile1\                created on first use
   profile2\ ...
 ```
@@ -45,9 +46,9 @@ In the installed version profiles live in `%APPDATA%\com.pake.youtube.tabs\`.
 `extensions\` takes unpacked extensions — a folder with a `manifest.json` inside.
 It is a single folder shared by every profile.
 
-| Build | Location |
-| --- | --- |
-| Portable | `extensions\` next to `YouTube.exe` |
+| Build     | Location                             |
+| --------- | ------------------------------------ |
+| Portable  | `extensions\` next to `YouTube.exe`  |
 | Installed | `%LOCALAPPDATA%\YouTube\extensions\` |
 
 The puzzle-piece button in the tab strip opens the settings of any extension that
@@ -64,6 +65,13 @@ options page joins the menu, under the name the extension itself declares. The
 button stays pinned to the right edge of the tab strip.
 
 To disable every extension without deleting anything: `YouTube.exe --no-extensions`.
+To load extensions from another folder, use `YouTube.exe --extensions-dir C:\ext`
+or set `YTPAKE_EXTENSIONS_DIR`. Before building, run `pnpm extensions:check` to
+validate the manifests; at runtime the same inventory is written to
+`%TEMP%\ytpake-trace.log` with the prefix `extensions:`.
+
+Extensions are optional. The application's own ad blocker works with an empty
+`extensions\` folder; see below.
 
 ## Tabs
 
@@ -85,22 +93,41 @@ The window title follows the active tab, in the title bar and the taskbar.
 
 ## About the ad blocker
 
-This build ships uBlock Origin Lite in `extensions\ublock-origin-lite`
-(GPL-3.0, <https://github.com/uBlockOrigin/uBOL-home>).
+Ad blocking is built in. It works on a fresh install with an empty `extensions\`
+folder — no download, no setup, no extension required.
 
-Use uBlock Origin Lite (Manifest V3), not classic uBlock Origin (Manifest V2).
-The classic one loads in WebView2 but leaves requests hanging: YouTube thumbnails
-never finish loading and new tabs sometimes come up blank.
+The app removes ad placements from YouTube's player data before the page sees it,
+answers known ad requests locally, hides the ad slots YouTube draws into the feed,
+search results and watch sidebar, and skips an ad in the player if one still
+plays. The player's own ad UI is left visible on purpose so a countdown and a
+skip button remain usable.
 
-To run without a blocker, delete the `extensions\ublock-origin-lite` folder. The
-application's own CSS keeps hiding the ad slots, but they will only be empty:
-without the blocker the requests go out as usual.
+To turn the built-in blocker off: `YouTube.exe --no-adblock`. This does not
+affect any extension.
 
-The blocker cancels ad requests, but WebView2 does not apply its cosmetic
-filters. The ads YouTube draws into the page itself — home, search, and the column
-beside the video — are not a request that can be cancelled, so the application
-hides those slots with its own CSS, injected before the page runs. The ad inside
-the player is the blocker's job.
+### Updating the filters
+
+The filter lists live in `filters\youtube.json`, not in the executable's code.
+When YouTube changes its markup, replace that file and restart the application —
+there is no need to rebuild or reinstall it.
+
+| Build        | Where to put an updated file                           |
+| ------------ | ------------------------------------------------------ |
+| Portable     | `YouTube-portable\filters\youtube.json`                |
+| Installed    | `%APPDATA%\com.pake.youtube.tabs\filters\youtube.json` |
+| One-off test | `YouTube.exe --filters C:\path\youtube.json`           |
+
+An invalid file is ignored and the app falls back to the copy shipped with the
+installer, then to the version compiled into the binary. The active source and
+version are written to `%TEMP%\ytpake-trace.log` on every launch. Before
+deploying a new file, run `pnpm filters:check` (or
+`node scripts/check-filters.mjs --file new.json`).
+
+The app does not download filter lists by itself. For lists that refresh
+automatically, add uBlock Origin Lite (Manifest V3) as an unpacked extension —
+it updates its own rulesets on top of the built-in blocker. Do not use classic
+uBlock Origin (Manifest V2): in WebView2 it leaves requests hanging, so
+thumbnails never finish loading and new tabs sometimes come up blank.
 
 ## Fullscreen
 
@@ -120,5 +147,11 @@ tab is where it was.
 - On first use WebView2 has to load the extension, so the page takes a few seconds
   and the extensions button only appears once it opens. From the second time on it
   is fast.
+- Ads still showing: the blocker is on by default, so check
+  `%TEMP%\ytpake-trace.log` for the `adblock filters:` line and confirm which
+  filter version is active. With remote debugging enabled on port 9222,
+  `python tools/adblock_probe.py` reports the blocker's live counters and any
+  visible ad slot. Replacing `filters\youtube.json` with a newer catalogue is
+  the usual fix when YouTube changes its markup.
 - To see what the application is doing: `%TEMP%\ytpake-trace.log`, one line per
   startup step, with the time in milliseconds.

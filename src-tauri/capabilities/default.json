@@ -28,6 +28,7 @@
     "allow-tabs-state",
     "allow-tabs-fullscreen",
     "allow-tabs-extension-menu",
+    "allow-tabs-open-external",
     "shell:allow-open",
     "core:event:default",
     "core:window:allow-theme",
