@@ -1,7 +1,7 @@
 # AGENTS.md - Pake Project Knowledge Base
 
-> **This checkout is the YouTube Desktop fork.** The upstream Pake CLI, gallery
-> and multi-app release workflows are retained only as build tooling and CI
+> **This checkout is the YouTube Desktop fork.** The upstream Pake CLI and
+> multi-app release workflows are retained only as build tooling and CI
 > coverage. The application that ships from `src-tauri/tauri.conf.json` is
 > YouTube-only: `src-tauri/src/app/youtube.rs` owns the navigation allowlist,
 > `src-tauri/src/inject/adblock.js` is the built-in blocker, and
@@ -9,8 +9,6 @@
 > `extensions/` are optional and are never required for ad blocking. Read
 > `README.md` and `docs/architecture.md` before changing those files. Everything
 > below describes upstream Pake and still applies to the retained CLI code.
-
-> Project-specific Rust + Tauri rules: `.claude/rules/rust.md`. Skills live under `.agents/skills/` (`/release`; `.claude/skills/*` are symlinks into `.agents/skills/`, edit the `.agents` copy only). Exception: the `pake` skill's real source is `plugins/pake/skills/pake/SKILL.md` (shipped to users via the Claude Code and Codex plugin marketplaces, `.claude-plugin/marketplace.json` and `.agents/plugins/marketplace.json`); `.agents/skills/pake` is a symlink to it.
 
 ## Project Identity
 
@@ -34,15 +32,11 @@ Pake/
 │   ├── Cargo.toml        # Rust dependencies and version
 │   ├── tauri.conf.json   # Tauri configuration and version
 │   └── .cargo/           # Cargo configuration (gitignored)
-├── .agents/skills/        # Agent skills (/release); .claude/skills/* symlinks here
 ├── dist/                 # Compiled CLI output
-├── docs/                 # Documentation
-│   ├── cli-usage.md      # CLI parameters
-│   ├── advanced-usage.md # Customization guide
-│   └── faq.md           # Troubleshooting
-├── gallery/              # Site recipes for the Pake apps' gallery (schema.json, tests/unit/gallery.test.ts)
+├── docs/                 # architecture.md, user-guide.md and CI incidents.md
+├── extensions/           # Optional unpacked WebView2 extensions
+├── filters/              # Runtime ad-block filter catalogue
 ├── schema/               # pake.schema.json: --config JSON schema (public contract)
-├── plugins/              # Claude Code and Codex plugin source (shared user-facing pake skill)
 ├── llms.txt              # Agent-facing contract summary (--json, --config, exit codes)
 ├── scripts/              # Utility scripts
 ├── tests/                # Unit, integration, and release-flow tests
@@ -69,7 +63,7 @@ Pake/
 | `pnpm test -- --no-build`                  | Full suite minus the multi-arch real build                              |
 | `pnpm test`                                | Full suite including release workflow                                   |
 
-Keep shared project facts in this file so Codex, Claude Code, and other agents use the same source of truth. Local-only overrides (`CLAUDE.local.md`, `AGENTS.override.md`, `.claude/settings.local.json`) stay ignored.
+Keep shared project facts in this file so Codex, Claude Code, and other agents use the same source of truth. Local-only overrides (`CLAUDE.local.md`, `AGENTS.override.md`) stay ignored.
 
 ## Code Conventions
 
@@ -85,7 +79,7 @@ Goals and project facts only; trust the agent to find its own path.
 
 ## Review Hard Stops
 
-Beyond the rebuild, version-sync, surface, CLI-flag, WebKit, and popup-routing invariants in this file and `.claude/rules/rust.md`, a review blocks on:
+Beyond the rebuild, version-sync, surface, CLI-flag, WebKit, and popup-routing invariants described in this file, a review blocks on:
 
 - npm release workflow changes that drop Trusted Publishing: `.github/workflows/npm-publish.yml`, `id-token: write`, canonical `git+https://github.com/tw93/Pake.git`, and `scripts/check-release-version.mjs` must survive.
 - A new helper in `bin/utils/` or `bin/helpers/` without a matching `tests/unit/<basename>.test.ts`.
@@ -234,8 +228,6 @@ For release follow-through, keep these boundaries explicit:
 
 `.github/workflows/quality-and-test.yml` runs Rust quality checks and CLI/build validation across Linux, Windows, and macOS; a push or PR that changes only files no job reads (Markdown other than `docs/incidents.md`, `assets/`, `CONTRIBUTORS.svg`, agent and plugin files) starts no run. Such a commit has no Quality run of its own, and neither has the `[skip ci]` bot commit that usually sits on top of `main`; before tagging or npm-publishing a head without its own green run, run `gh workflow run quality-and-test.yml --ref main` and wait for that run; dispatch ignores the path filter. Auto-format moved into `update-contributors.yml`, which commits Prettier and `cargo fmt` fixes together with the contributors image as one `[skip ci]` bot commit, so the never-tag-a-`[skip ci]`-commit rule covers formatting commits too.
 
-Deployment-surface note: the Claude Code and Codex plugins (`.claude-plugin/marketplace.json`, `.agents/plugins/marketplace.json`, and `plugins/pake`) ship from `main` via git, independent of `V*` releases. Skill and manifest edits reach new installs as soon as they land on `main`; npm and app assets still wait for their release workflows.
-
 ### Network Mirror Behavior
 
 Pake uses official npm and Rust sources by default. CN mirrors are explicit opt-in only:
@@ -261,7 +253,7 @@ Sort every community PR into one of three outcomes; never rewrite a contribution
 
 ## Troubleshooting
 
-See `docs/faq.md` for common issues and solutions.
+See `README.md` and `docs/user-guide.md` for common issues and solutions.
 
 ### macOS SDK / Compile Errors
 
@@ -285,12 +277,14 @@ The first `cargo build` on a fresh clone takes 10+ minutes as Cargo compiles eve
 
 ## Documentation Guidelines
 
-- **Main README**: keep only common, frequently-used parameters to avoid clutter.
-- **CLI Documentation** (`docs/cli-usage.md` and locale variants): include **all** CLI parameters with detailed usage examples.
-- **Rare or advanced parameters**: should have full documentation in `docs/cli-usage*.md` but minimal or no mention in the main README. Examples: `--title`, `--incognito`, `--system-tray-icon`, `--multi-window`, `--min-width`, `--min-height`.
-- **README popular-packages showcase**: apps render in pairs of `<td>` cells, each with a 600px-wide screenshot from `https://raw.githubusercontent.com/tw93/static/main/pake/<Title>.png` or `.jpg` (the showcase currently mixes both; source spec 2624x1784, a Retina window capture). Upload the screenshot to `tw93/static` before pushing the README row, and note the app's download links stay 404 until the next `V*` release builds its assets.
-- **App list curation**: judge showcase or `default_app_list.json` additions and removals with real demand from `gh release view <tag> --json assets` download counts, not intuition. Keep both README locales in the same order.
+- `README.md` describes the shipped YouTube application. Keep it in English and
+  limited to what the app actually does.
+- `docs/user-guide.md` is the end-user guide; `docs/architecture.md` explains the
+  tab system, WebView2 extension warm-up and the built-in blocker.
+- `docs/incidents.md` is read by `scripts/check-incidents.mjs` and by the CI path
+  filter — do not delete it.
+- Filter changes belong in `filters/youtube.json` (never hardcode rules in
+  `src-tauri/src/inject/adblock.js`); see `filters/README.md`.
 - **Key configuration files**:
-  - `src-tauri/pake.json` - default app configuration (CLI options are merged into it at build time).
-  - `src-tauri/tauri.conf.json` - shared Tauri settings.
-  - `src-tauri/tauri.{macos,windows,linux}.conf.json` - per-platform overrides.
+  - `src-tauri/pake.json` - default app configuration (embedded in the binary).
+  - `src-tauri/tauri.conf.json` - Tauri settings, bundle icons and resources.

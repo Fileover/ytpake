@@ -16,8 +16,8 @@ adds a tab system on top, and narrows the whole shell down to one site: YouTube.
 ## Scope: YouTube only
 
 This repository builds **one application**, not a general-purpose site wrapper.
-The upstream Pake CLI, gallery and multi-app release workflows remain in the tree
-as build tooling; the shipped app is locked to YouTube:
+The upstream Pake CLI and multi-app release workflows remain in the tree as
+build tooling; the shipped app is locked to YouTube:
 
 - Every tab address goes through an allowlist (`youtube.com`, its subdomains,
   `youtube-nocookie.com`, `youtu.be` and the two Google hosts used by sign-in).
@@ -234,8 +234,6 @@ files. Documentation and code comments are in English.
   warm-up and WebView2 behaviour.
 - [filters/README.md](filters/README.md) — updating the filter catalogue.
 - [extensions/README.md](extensions/README.md) — installing extensions.
-- [README_PAKE.md](README_PAKE.md) — upstream Pake documentation; the `pake`
-  CLI still works as described there, but this fork builds only YouTube.
 
 ## Credits
 
