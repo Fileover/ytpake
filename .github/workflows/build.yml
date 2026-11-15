@@ -1,0 +1,58 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+      - "V*"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  build:
+    name: Windows (x64)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable-x86_64-pc-windows-msvc
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Run unit tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib
+
+      - name: Build release binary
+        run: cargo build --manifest-path src-tauri/Cargo.toml --release --bin YouTube
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: YouTube-windows-x64
+          path: src-tauri/target/release/YouTube.exe
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: src-tauri/target/release/YouTube.exe
+          generate_release_notes: true
