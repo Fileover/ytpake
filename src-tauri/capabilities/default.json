@@ -1,20 +1,19 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "pake-capability",
-  "description": "Capability for the tabbed Pake shell: the local tab strip and every content webview.",
+  "description": "Capability for the tabbed YouTube shell: the local tab strip and every content webview.",
+  "local": true,
+  "remote": {
+    "urls": [
+      "https://www.youtube.com/*",
+      "https://*.youtube.com/*",
+      "https://youtube-nocookie.com/*",
+      "https://*.youtube-nocookie.com/*",
+      "https://youtu.be/*"
+    ]
+  },
   "webviews": ["pake", "pake-*"],
   "permissions": [
-    "allow-download-file",
-    "allow-send-notification",
-    "allow-close-notification",
-    "allow-increment-dock-badge",
-    "allow-set-dock-badge",
-    "allow-set-dock-badge-label",
-    "allow-clear-dock-badge",
-    "allow-update-theme-mode",
-    "allow-set-zoom",
-    "allow-webview-navigate",
-    "allow-set-title-bar-color",
     "allow-tabs-new",
     "allow-tabs-close",
     "allow-tabs-close-active",
@@ -29,7 +28,6 @@
     "allow-tabs-fullscreen",
     "allow-tabs-extension-menu",
     "allow-tabs-open-external",
-    "shell:allow-open",
     "core:event:default",
     "core:window:allow-theme",
     "core:window:allow-start-dragging",
@@ -42,12 +40,6 @@
     "core:window:allow-close",
     "core:webview:allow-internal-toggle-devtools",
     "core:webview:allow-print",
-    "notification:allow-is-permission-granted",
-    "notification:allow-notify",
-    "notification:allow-get-active",
-    "notification:allow-register-listener",
-    "notification:allow-register-action-types",
-    "notification:default",
     "core:path:default"
   ]
 }

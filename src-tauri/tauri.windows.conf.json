@@ -1,7 +1,0 @@
-{
-  "bundle": {
-    "icon": ["png/youtube_256.ico", "png/youtube_32.ico"],
-    "active": true,
-    "targets": ["nsis"]
-  }
-}

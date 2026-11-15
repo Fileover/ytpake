@@ -1,13 +1,4 @@
-//! Tabbed browsing shell.
-//!
-//! Pake's default shell is one webview per window. That is fine for a single
-//! page, but a site like YouTube is used across several pages at once. This
-//! module keeps a single native window and hosts one child webview per tab,
-//! plus a small local webview at the top that draws the tab strip.
-//!
-//! The content webviews are real WebView2/WKWebView instances, so every tab
-//! keeps its own player, scroll position and history; switching tabs only
-//! toggles their visibility.
+//! Tabbed browsing shell for YouTube Desktop.
 
 use std::collections::HashMap;
 use std::fs;
@@ -20,63 +11,38 @@ use serde::{Deserialize, Serialize};
 use tauri::{
     menu::{Menu, MenuItem},
     webview::{Color, NewWindowResponse, WebviewBuilder},
-    AppHandle, Config, Emitter, Manager, PhysicalPosition, PhysicalSize, Position, Rect, Size, Url,
+    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, Position, Rect, Size, Url,
     Webview, WebviewUrl, WindowEvent,
 };
 use tauri_plugin_opener::OpenerExt;
 
-use crate::app::config::PakeConfig;
-use crate::app::extensions::{self, ExtensionInfo};
-use crate::app::filters;
+use crate::app::extensions::{self, ExtensionInfo, ProfileExtensionPlan};
 use crate::app::profile::{
-    adblock_enabled, extensions_disabled, requested as requested_profile,
-    resolve as resolve_profile, DEFAULT_PROFILE,
+    extensions_disabled, requested as requested_profile, resolve as resolve_profile,
+    DEFAULT_PROFILE,
 };
 use crate::app::youtube;
 
-/// Label of the native window that hosts every webview.
 pub const WINDOW_LABEL: &str = "pake";
-/// Label of the local webview that draws the tab strip.
 pub const CHROME_LABEL: &str = "pake-chrome";
-/// Height of the tab strip, in logical pixels.
 const CHROME_HEIGHT: f64 = 40.0;
-/// Injected into every content webview before the page's own scripts run.
-const BRIDGE_JS: &str = include_str!("../inject/tab_bridge.js");
-const ADBLOCK_JS: &str = include_str!("../inject/adblock.js");
+const DEFAULT_WIDTH: f64 = 1440.0;
+const DEFAULT_HEIGHT: f64 = 900.0;
+const APP_IDENTIFIER: &str = "com.pake.youtube.tabs";
+const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
 
-/// The path of the throwaway document a tab shows before its real address.
-/// A 404 is the cheapest HTML any site will serve, and it is never the address
-/// the tab was asked to open.
-const WARMUP_PATH: &str = "/this-page-does-not-exist-warmup";
-const NEW_TAB_TITLE: &str = "Nova aba";
-/// Prefix of the ids used by the native extensions menu.
+const BRIDGE_JS: &str = include_str!("../inject/tab_bridge.js");
+const NEW_TAB_TITLE: &str = "New tab";
 const EXTENSION_MENU_PREFIX: &str = "pake-ext-";
-/// How long a new tab may sit without starting to load before it is retried.
-const STALL_RETRY: std::time::Duration = std::time::Duration::from_secs(4);
-/// How many times a tab that never started is asked again. Four seconds apart,
-/// so a tab that is going to load has twenty seconds of attempts behind it.
+const STALL_RETRY: Duration = Duration::from_secs(4);
 const STALL_ATTEMPTS: u32 = 5;
 
-/// True while the active page holds an HTML fullscreen element.
 static FULLSCREEN: AtomicBool = AtomicBool::new(false);
-
-/// WebView2 can refuse a whole extension folder. Retrying every new tab with
-/// the same folder only reproduces the failure, so remember it for the session;
-/// the built-in ad blocker keeps working either way.
 static EXTENSION_LOAD_FAILED: AtomicBool = AtomicBool::new(false);
-
-/// The last address a new-window request asked for, with the moment it arrived.
-///
-/// One gesture can produce two requests — WebView2 raises its own for a
-/// middle-click and the page can raise another through `window.open` — and
-/// each one used to become a tab, so a single click opened two. Remembering
-/// the last request makes the repeat a no-op.
+static PROFILE_SYNCED: AtomicBool = AtomicBool::new(false);
 static LAST_POPUP: Mutex<Option<(String, Instant)>> = Mutex::new(None);
-
-/// Window within which a repeated request for the same address is ignored.
 const POPUP_REPEAT: Duration = Duration::from_millis(700);
 
-/// One tab, as serialized to the tab strip webview.
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TabView {
@@ -91,7 +57,6 @@ pub struct TabView {
 pub struct TabsState {
     pub tabs: Vec<TabView>,
     pub active: Option<u32>,
-    /// Extensions that can show a settings page, for the tab strip menu.
     pub extensions: Vec<ExtensionInfo>,
 }
 
@@ -100,15 +65,11 @@ pub struct TabEntry {
     pub title: String,
     pub url: String,
     pub loading: bool,
-    /// Set as soon as the webview reports any load event.
     started: bool,
 }
 
-/// A tab whose webview is warming its renderer before loading the real page.
 struct Pending {
     target: Url,
-    /// Set once the navigation to `target` has been issued, so the retry timer
-    /// and the page-load handler cannot both fire it.
     dispatched: bool,
 }
 
@@ -117,51 +78,36 @@ struct Tabs {
     items: Vec<TabEntry>,
     active: Option<u32>,
     next_id: u32,
-    /// Tabs still showing their warm-up document instead of the real page.
-    ///
-    /// WebView2 attaches extension content scripts only to a renderer that
-    /// already exists, so a webview created straight at the target URL runs
-    /// that page without any extension. Opening a cheap page on the same
-    /// origin first gives the renderer a document to be created for.
     pending: HashMap<u32, Pending>,
 }
 
 pub struct TabManager {
     state: Mutex<Tabs>,
-    pub config: PakeConfig,
     pub data_dir: PathBuf,
     pub session_path: Option<PathBuf>,
-    /// Folder of unpacked extensions, shared by every profile. WebView2 loads
-    /// every immediate subfolder that contains a `manifest.json`.
     pub extensions_dir: Option<PathBuf>,
-    /// Resolved profile number, `DEFAULT_PROFILE` when no flag was given.
+    pub extension_plan: ProfileExtensionPlan,
     pub profile_id: u32,
-    /// Cached settings-page list. WebView2 only records an extension id once it
-    /// has loaded, so the cache is refreshed on demand.
     extensions: Mutex<Vec<ExtensionInfo>>,
-    /// Runtime filter catalogue, injected into every tab before `adblock.js`.
-    /// Loaded once at startup so replacing the JSON only needs a restart.
-    pub filter_script: String,
 }
 
 impl TabManager {
     pub fn new(
-        config: PakeConfig,
         data_dir: PathBuf,
         session_path: Option<PathBuf>,
         extensions_dir: Option<PathBuf>,
+        extension_plan: ProfileExtensionPlan,
         profile_id: u32,
-        filter_script: String,
+        initial_extensions: Vec<ExtensionInfo>,
     ) -> Self {
         Self {
             state: Mutex::new(Tabs::default()),
-            config,
             data_dir,
             session_path,
             extensions_dir,
+            extension_plan,
             profile_id,
-            extensions: Mutex::new(Vec::new()),
-            filter_script,
+            extensions: Mutex::new(initial_extensions),
         }
     }
 
@@ -169,7 +115,6 @@ impl TabManager {
         self.state.lock().unwrap_or_else(|error| error.into_inner())
     }
 
-    /// Re-read the extension folders and their assigned ids.
     fn refresh_extensions(&self) -> Vec<ExtensionInfo> {
         let found = self
             .extensions_dir
@@ -220,19 +165,10 @@ impl TabManager {
     fn active_id(&self) -> Option<u32> {
         self.lock().active
     }
-
-    fn user_agent(&self) -> String {
-        self.config.user_agent.get().clone()
-    }
 }
 
-/// GUI-subsystem builds have no console, so `eprintln!` can vanish. Diagnostics
-/// go to a file in the temp directory instead, prefixed with the time since the
-/// first message so startup phases can be compared.
 pub fn trace(message: &str) {
     use std::io::Write;
-    use std::sync::OnceLock;
-    use std::time::Instant;
 
     static START: OnceLock<Instant> = OnceLock::new();
     let elapsed = START.get_or_init(Instant::now).elapsed().as_millis();
@@ -247,6 +183,13 @@ pub fn trace(message: &str) {
     }
 }
 
+#[cfg(windows)]
+fn set_app_user_model_id(id: &str) {
+    use windows_sys::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
+    let wide: Vec<u16> = id.encode_utf16().chain(std::iter::once(0)).collect();
+    let _ = unsafe { SetCurrentProcessExplicitAppUserModelID(wide.as_ptr()) };
+}
+
 fn tab_label(id: u32) -> String {
     format!("pake-tab-{id}")
 }
@@ -255,10 +198,6 @@ fn parse_tab_id(label: &str) -> Option<u32> {
     label.strip_prefix("pake-tab-")?.parse().ok()
 }
 
-/// Open a link that points outside YouTube in the user's default browser.
-///
-/// The shell itself stays YouTube-only; the system browser is the right place
-/// for a channel's website, a support page or any other external link.
 fn open_external(app: &AppHandle, url: &Url) {
     if !matches!(url.scheme(), "http" | "https") {
         return;
@@ -275,7 +214,6 @@ fn open_external(app: &AppHandle, url: &Url) {
     });
 }
 
-/// Resize the tab strip and every content webview to match the window.
 pub fn layout(app: &AppHandle) {
     let Some(window) = app.get_window(WINDOW_LABEL) else {
         return;
@@ -284,7 +222,6 @@ pub fn layout(app: &AppHandle) {
         return;
     };
 
-    // A fullscreen video covers the whole window, tab strip included.
     let fullscreen = FULLSCREEN.load(Ordering::Relaxed);
     let strip = if fullscreen {
         0
@@ -324,15 +261,10 @@ fn emit_state(app: &AppHandle) {
     }
 }
 
-/// Show the active tab and hide the rest, then re-run layout.
 fn apply_active(app: &AppHandle) {
     let manager = app.state::<TabManager>();
     let active = manager.active_id();
-    // A tab that is still warming its renderer has no real page to show yet.
-    let warming: Vec<u32> = match warmup_hidden() {
-        true => manager.lock().pending.keys().copied().collect(),
-        false => Vec::new(),
-    };
+    let warming: Vec<u32> = manager.lock().pending.keys().copied().collect();
     layout(app);
     for webview in app.webviews().values() {
         if webview.label() == CHROME_LABEL {
@@ -342,10 +274,6 @@ fn apply_active(app: &AppHandle) {
         if id == active && !id.is_some_and(|id| warming.contains(&id)) {
             let _ = webview.show();
             let _ = webview.set_focus();
-            // A navigation issued to a hidden webview is dropped rather than
-            // queued, and the tab would then sit on its warm-up document for
-            // good — hidden tabs are the ones that hit this, since nothing
-            // else ever asks them again. Once the tab is on screen, ask.
             if let Some(id) = id {
                 resume_target(app, id, &webview);
             }
@@ -355,7 +283,6 @@ fn apply_active(app: &AppHandle) {
     }
 }
 
-/// Navigate a tab that was shown without ever having reached its destination.
 fn resume_target(app: &AppHandle, id: u32, webview: &Webview) {
     let manager = app.state::<TabManager>();
     let target = {
@@ -389,79 +316,48 @@ fn build_webview(
 ) -> tauri::Result<Webview> {
     let manager = app.state::<TabManager>();
     let label = tab_label(id);
-    let user_agent = manager.user_agent();
     let data_dir = manager.data_dir.clone();
-    let extensions = manager.extensions_dir.clone().filter(|directory| {
-        allow_extensions
-            && !extensions_disabled()
-            && !EXTENSION_LOAD_FAILED.load(Ordering::Relaxed)
-            && extensions::has_extensions(directory)
-    });
+    let use_extensions = allow_extensions
+        && !extensions_disabled()
+        && !EXTENSION_LOAD_FAILED.load(Ordering::Relaxed)
+        && manager.extension_plan.has_extensions();
+
+    let need_sync = use_extensions && !PROFILE_SYNCED.swap(true, Ordering::AcqRel);
+    let wait_for_initial_install =
+        need_sync && !manager.extension_plan.missing_folders.is_empty();
+
+    let start = if wait_for_initial_install {
+        manager.lock().pending.insert(
+            id,
+            Pending {
+                target: url.clone(),
+                dispatched: false,
+            },
+        );
+        Url::parse("about:blank").unwrap_or(url)
+    } else {
+        manager.lock().pending.remove(&id);
+        url
+    };
 
     let title_app = app.clone();
     let load_app = app.clone();
     let popup_app = app.clone();
     let navigation_app = app.clone();
-    let adblock_flag = if adblock_enabled() {
-        "window.__YTPAKE_ADBLOCK_ENABLED__ = true;"
-    } else {
-        "window.__YTPAKE_ADBLOCK_ENABLED__ = false;"
-    };
-    let filter_script = manager.filter_script.clone();
-
-    // WebView2 only hands extension content scripts to a renderer that already
-    // exists, so the very first page of a new webview runs without them: the
-    // extension appears in the menu and its options page opens, but nothing is
-    // applied to the site. Loading a cheap page on the same origin first brings
-    // the renderer up, and replacing it with the real address then gets the
-    // scripts at document_start. Only tabs with extensions pay for the hop.
-    let start = match extensions.is_some() {
-        true => match warmup_url(&url) {
-            Some(warmup) => {
-                manager.lock().pending.insert(
-                    id,
-                    Pending {
-                        target: url.clone(),
-                        dispatched: false,
-                    },
-                );
-                warmup
-            }
-            None => url,
-        },
-        false => {
-            // The fallback build has no extensions, so it navigates directly
-            // and must not leave a pending destination behind.
-            manager.lock().pending.remove(&id);
-            url
-        }
-    };
 
     let mut builder = WebviewBuilder::new(label, WebviewUrl::External(start))
-        .user_agent(&user_agent)
+        .user_agent(USER_AGENT)
         .data_directory(data_dir)
-        // The shell is dark; without this the throwaway document flashes white.
         .background_color(Color(15, 15, 15, 255))
         .initialization_script(BRIDGE_JS)
-        // The built-in blocker runs before YouTube's own scripts and does not
-        // depend on an extension being installed. Extensions are a second,
-        // optional layer on top of it.
-        .initialization_script(adblock_flag)
-        .initialization_script(filter_script.as_str())
-        .initialization_script(ADBLOCK_JS)
-        // This shell is YouTube-only. A page that tries to navigate anywhere
-        // else is denied and the link is handed to the system browser instead.
         .on_navigation(move |url| {
-            if youtube::allows_navigation(url) {
+            if youtube::allows_navigation(url) || url.as_str() == "about:blank" {
                 return true;
             }
             open_external(&navigation_app, url);
             false
         })
         .on_new_window(move |url, _features| {
-            // Sites open links with window.open; a YouTube link becomes a new
-            // tab, an external one goes to the system browser. The closure
-            // runs off the main thread on Windows, so spawning a tab is safe.
             if !matches!(url.scheme(), "http" | "https") {
                 return NewWindowResponse::Deny;
             }
@@ -472,9 +368,6 @@ fn build_webview(
             let target = url.to_string();
             if !popup_is_duplicate(&target) {
                 let app = popup_app.clone();
-                // In the background: the page the user is on keeps the
-                // focus, the way a middle click behaves in a browser. The
-                // tab loads while it is out of sight.
                 std::thread::spawn(move || {
                     let _ = open_tab(&app, Some(target), false);
                 });
@@ -482,54 +375,35 @@ fn build_webview(
             NewWindowResponse::Deny
         })
         .on_document_title_changed(move |webview, title| {
-            // The throwaway warm-up document is skipped: its title is the
-            // site's 404 page, and taking it would wipe a restored tab's real
-            // name. The check is on the document being shown rather than on
-            // the tab's pending flag, because the real page usually reports
-            // its title before the load is reported as finished — gating on
-            // that flag threw the title away and left the tab called
-            // "Nova aba" with a video already playing in it.
-            trace(&format!(
-                "title {} {:?} at {:?}",
-                webview.label(),
-                title,
-                webview.url().map(|url| url.to_string())
-            ));
-            if title.trim().is_empty() {
+            let trimmed = title.trim();
+            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("about:blank") {
                 return;
             }
-            if let Ok(url) = webview.url() {
-                if url.path() == WARMUP_PATH {
+            if let Ok(current) = webview.url() {
+                if current.as_str() == "about:blank" {
                     return;
                 }
             }
             if let Some(id) = parse_tab_id(webview.label()) {
-                update_title(&title_app, id, &title);
+                update_title(&title_app, id, trimmed);
             }
         })
         .on_page_load(move |webview, payload| {
+            if payload.url().as_str() == "about:blank" {
+                return;
+            }
             if let Some(id) = parse_tab_id(webview.label()) {
                 let finished = matches!(payload.event(), tauri::webview::PageLoadEvent::Finished);
                 update_loading(&load_app, id, payload.url(), finished);
             }
         });
 
-    // Only tabs that load extensions have to queue: without them there is
-    // nothing to register, and waiting would just slow the app down.
-    let queued = extensions.is_some();
-
-    if let Some(directory) = extensions {
-        // WebView2 needs the environment flag before it will accept a profile
-        // extension; Tauri forwards both to wry.
-        builder = builder
-            .browser_extensions_enabled(true)
-            .extensions_path(directory);
+    if use_extensions {
+        builder = builder.browser_extensions_enabled(true);
     }
 
     #[cfg(target_os = "windows")]
     {
-        // wry replaces its defaults when this is set, so keep them and add
-        // autoplay: YouTube should start a video on click, not need a second one.
         builder = builder.additional_browser_args(
             "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection \
              --autoplay-policy=no-user-gesture-required",
@@ -539,11 +413,6 @@ fn build_webview(
     let window = app
         .get_window(WINDOW_LABEL)
         .ok_or_else(|| tauri::Error::WindowNotFound)?;
-    // Only tabs that load extensions have to queue: without them there is
-    // nothing to register, and waiting would just slow the app down.
-    if queued {
-        wait_for_creation_slot();
-    }
 
     let webview = window.add_child(
         builder,
@@ -552,122 +421,32 @@ fn build_webview(
     )?;
     trace(&format!("tab {id}: webview added"));
 
-    // A tab still warming its renderer shows a throwaway document; keep it off
-    // screen until the real page starts loading.
-    if warmup_hidden() && manager.lock().pending.contains_key(&id) {
+    if wait_for_initial_install {
         let _ = webview.hide();
     }
+
+    #[cfg(windows)]
+    if need_sync {
+        let sync_app = app.clone();
+        let plan = manager.extension_plan.clone();
+        extensions::sync_webview_profile(&webview, plan, move |added_any| {
+            let manager = sync_app.state::<TabManager>();
+            if !manager.refresh_extensions().is_empty() {
+                emit_state(&sync_app);
+            }
+            if wait_for_initial_install {
+                send_to_target(&sync_app, id);
+            } else if added_any {
+                if let Some(wv) = sync_app.get_webview(&tab_label(id)) {
+                    let _ = wv.reload();
+                }
+            }
+        });
+    }
+
     Ok(webview)
 }
 
-/// The throwaway page a tab loads before its real address.
-///
-/// Three things it has to be, and the third one is easy to miss:
-///
-/// - On the target's own origin, so the extensions treat it as the real site.
-/// - HTML. `robots.txt` is the cheapest thing a site serves and it does bring
-///   the renderer up, but it arrives as `text/plain` and content scripts do not
-///   run there at all, so it warmed the renderer and never the extensions.
-/// - A different address from the destination. A warm-up document at the same
-///   address is not a second load — the page keeps whatever the extension
-///   worker handed out while it was still starting, which is why the home page
-///   kept its ads until a reload.
-///
-/// A page that does not exist satisfies all three for the price of a 404: on
-/// YouTube it is a 758-byte `text/html` document answered in about 190 ms,
-/// against a couple of seconds for the home page it used to load.
-fn warmup_url(target: &Url) -> Option<Url> {
-    if !matches!(target.scheme(), "http" | "https") {
-        return None;
-    }
-    let host = target.host_str()?;
-
-    let mut warmup = Url::parse(&format!("{}://{host}", target.scheme())).ok()?;
-    if let Some(port) = target.port() {
-        warmup.set_port(Some(port)).ok()?;
-    }
-    warmup.set_path(WARMUP_PATH);
-    warmup.set_query(None);
-    Some(warmup)
-}
-
-/// How long a tab keeps its warm-up document before loading the real page.
-///
-/// The value is what the extension host needs to register the renderer: a
-/// document created before the host is ready never receives the content
-/// scripts, which showed up as one tab in three coming up without the
-/// extension. The throwaway page is HTML, so the host is already working on it
-/// by the time the document has finished loading, and the wait on top of that
-/// only has to cover the reply.
-///
-/// Measured on this machine: 400 ms held over two runs of three tabs, and zero
-/// is where it breaks. This sits above that measurement rather than at the
-/// edge. The value is the same for every tab — the first tab's extra second
-/// only ever paid for the service worker, which the HTML warm-up page now wakes
-/// on its own.
-/// `PAKE_WARMUP_DELAY_MS` overrides it so the threshold can be measured on a
-/// machine without rebuilding.
-fn warmup_delay() -> Duration {
-    static DELAY: OnceLock<Option<Duration>> = OnceLock::new();
-
-    let override_ms = *DELAY.get_or_init(|| {
-        std::env::var("PAKE_WARMUP_DELAY_MS")
-            .ok()
-            .and_then(|raw| raw.trim().parse::<u64>().ok())
-            .map(Duration::from_millis)
-    });
-    override_ms.unwrap_or(Duration::from_millis(500))
-}
-
-/// Minimum gap between two tab webviews while extensions are loaded.
-///
-/// WebView2 registers an extension's content scripts with a webview once, and
-/// it cannot do that for several webviews at the same time: four tabs created
-/// together all end up without the scripts, while the same tabs created a few
-/// seconds apart all keep them. Four seconds is the smallest gap that held up
-/// in measurement.
-const TAB_SPACING: Duration = Duration::from_millis(4_000);
-
-/// When the previous tab webview was created.
-static LAST_CREATE: Mutex<Option<Instant>> = Mutex::new(None);
-
-/// Wait until this tab may be created without racing the previous one.
-///
-/// The lock is held across the wait, which is what serializes the callers.
-fn wait_for_creation_slot() {
-    let mut last = LAST_CREATE
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    if let Some(at) = *last {
-        let elapsed = at.elapsed();
-        if elapsed < TAB_SPACING {
-            let wait = TAB_SPACING - elapsed;
-            trace(&format!("slot: waiting {}ms", wait.as_millis()));
-            std::thread::sleep(wait);
-        }
-    }
-    *last = Some(Instant::now());
-}
-
-/// Whether a tab hides itself while it warms its renderer.
-///
-/// Overridable through `PAKE_WARMUP_HIDE=0` so the effect of a hidden webview
-/// on the extension host can be measured without rebuilding.
-fn warmup_hidden() -> bool {
-    static HIDDEN: OnceLock<bool> = OnceLock::new();
-
-    *HIDDEN.get_or_init(|| {
-        std::env::var("PAKE_WARMUP_HIDE")
-            .map(|raw| raw.trim() != "0")
-            .unwrap_or(true)
-    })
-}
-
-/// True when the same address was just turned into a tab.
-///
-/// Recorded before the tab is created, so the two requests of a single
-/// gesture cannot both pass. The lock is poisoned only if a panic happens
-/// while it is held, and the value is still usable then.
 fn popup_is_duplicate(target: &str) -> bool {
     let mut last = LAST_POPUP.lock().unwrap_or_else(|error| error.into_inner());
     if let Some((seen, at)) = last.as_ref() {
@@ -679,16 +458,11 @@ fn popup_is_duplicate(target: &str) -> bool {
     false
 }
 
-/// Show the settings of an extension, embedded in the active tab.
-///
-/// WebView2 refuses `chrome-extension://` as a top-level document, so the page
-/// is opened in an iframe overlay instead. `extensions::settings_pages` makes
-/// sure the page is embeddable first.
 fn open_extension_settings(app: &AppHandle, url: &str) -> Result<(), String> {
     if !url.starts_with("chrome-extension://") {
-        return Err("endereço de extensão inválido".into());
+        return Err("invalid extension URL".into());
     }
-    let webview = active_webview(app).ok_or_else(|| "nenhuma aba ativa".to_string())?;
+    let webview = active_webview(app).ok_or_else(|| "no active tab".to_string())?;
     let payload = serde_json::to_string(url).map_err(|error| error.to_string())?;
     webview
         .eval(&format!(
@@ -697,16 +471,12 @@ fn open_extension_settings(app: &AppHandle, url: &str) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
-/// Open the extensions menu at the cursor.
-///
-/// A single extension is opened straight away; two or more get a native popup
-/// menu, which is the only kind of menu that can extend past the 40px tab strip.
 #[tauri::command]
 pub async fn tabs_extension_menu(app: AppHandle) -> Result<(), String> {
     let manager = app.state::<TabManager>();
     let found = manager.refresh_extensions();
     if found.is_empty() {
-        return Err("nenhuma extensão com página de configuração".into());
+        return Err("no extension with a settings page".into());
     }
 
     if let [only] = found.as_slice() {
@@ -728,14 +498,10 @@ pub async fn tabs_extension_menu(app: AppHandle) -> Result<(), String> {
 
     let window = app
         .get_window(WINDOW_LABEL)
-        .ok_or_else(|| "janela indisponível".to_string())?;
+        .ok_or_else(|| "window unavailable".to_string())?;
     window.popup_menu(&menu).map_err(|error| error.to_string())
 }
 
-/// Add a tab to the strip and return its id and address, without a webview.
-///
-/// Keeping the two steps apart lets a restored session put every tab on screen
-/// at once while the webviews are built one at a time behind them.
 fn reserve_tab(app: &AppHandle, url: Option<&str>, activate: bool) -> (u32, Url) {
     let manager = app.state::<TabManager>();
     let target = youtube::target(url.unwrap_or(youtube::HOME));
@@ -760,13 +526,10 @@ fn reserve_tab(app: &AppHandle, url: Option<&str>, activate: bool) -> (u32, Url)
     (id, target)
 }
 
-/// Build a reserved tab's webview and start loading its page.
 fn create_webview(app: &AppHandle, id: u32, target: Url) -> Result<(), String> {
     let manager = app.state::<TabManager>();
     let (width, height, strip) = window_metrics(app);
 
-    // A single extension WebView2 refuses to load aborts webview creation, so
-    // the tab is retried without extensions and they stay off for the session.
     let mut built = build_webview(app, id, target.clone(), strip, width, height, true);
     if built.is_err() && !extensions_disabled() {
         trace("extension loading failed; opening tabs without extensions for this session");
@@ -775,7 +538,6 @@ fn create_webview(app: &AppHandle, id: u32, target: Url) -> Result<(), String> {
     }
     if let Err(error) = built {
         trace(&format!("failed to open a tab at {target}: {error}"));
-        // Roll back so the tab strip never shows a tab without a webview.
         let mut state = manager.lock();
         state.items.retain(|tab| tab.id != id);
         state.pending.remove(&id);
@@ -785,40 +547,6 @@ fn create_webview(app: &AppHandle, id: u32, target: Url) -> Result<(), String> {
         return Err(error.to_string());
     }
 
-    // Safety net: a tab stuck on its warm-up document would stay invisible and
-    // never reach the site, so force the destination after a few seconds. The
-    // normal path is not used here on purpose: the point of the timeout is
-    // that it did not fire, so its "already sent" flag must not block this.
-    let fallback = app.clone();
-    let destination = target.clone();
-    std::thread::spawn(move || {
-        // Long enough for the normal path to finish its own warm-up. The
-        // warm-up document has to finish loading before the normal path even
-        // starts counting, so the margin covers that load as well as the delay
-        // itself.
-        std::thread::sleep(warmup_delay() + Duration::from_millis(6_000));
-        let manager = fallback.state::<TabManager>();
-        if !manager.lock().pending.contains_key(&id) {
-            return;
-        }
-        trace(&format!("tab {id}: warm-up timed out"));
-
-        if let Some(webview) = fallback.get_webview(&tab_label(id)) {
-            if let Err(error) = webview.navigate(destination) {
-                trace(&format!("tab {id}: timed-out navigation failed: {error}"));
-            }
-        }
-
-        // Give the page a moment, then stop treating the tab as warming so a
-        // failure here cannot leave it invisible forever.
-        let handle = fallback.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(2_000));
-            let manager = handle.state::<TabManager>();
-            manager.lock().pending.remove(&id);
-            apply_active(&handle);
-        });
-    });
     apply_active(app);
     emit_state(app);
     save_session(app);
@@ -826,20 +554,12 @@ fn create_webview(app: &AppHandle, id: u32, target: Url) -> Result<(), String> {
     Ok(())
 }
 
-/// Open a tab, optionally pointing at `url`, and return its id.
 pub fn open_tab(app: &AppHandle, url: Option<String>, activate: bool) -> Result<u32, String> {
     let (id, target) = reserve_tab(app, url.as_deref(), activate);
     create_webview(app, id, target)?;
     Ok(id)
 }
 
-/// Re-navigate a tab that never started loading.
-///
-/// WebView2 drops a navigation now and then when extensions are enabled, and a
-/// tab that never starts would sit on its throwaway document for good. One
-/// retry used to be enough; the retry itself can be dropped too, so the tab is
-/// asked a few times. Every attempt is conditional on the tab still not having
-/// started, so a page that loads stops the loop on the next tick.
 fn watch_for_stall(app: AppHandle, id: u32, target: Url) {
     tauri::async_runtime::spawn(async move {
         for attempt in 1..=STALL_ATTEMPTS {
@@ -875,31 +595,22 @@ fn window_metrics(app: &AppHandle) -> (u32, u32, u32) {
     (size.width, size.height.saturating_sub(strip), strip)
 }
 
-/// Put a tab title in the window caption.
-///
-/// Used both when the active tab's own title changes and when another tab
-/// becomes active: switching tabs used to leave the previous tab's name in the
-/// caption, because only a title change ever wrote it.
 fn set_window_title(app: &AppHandle, display: &str) {
     let profile_id = app.state::<TabManager>().profile_id;
     let Some(window) = app.get_window(WINDOW_LABEL) else {
         return;
     };
-    // The home page is already called "YouTube"; suffixing it would read
-    // "YouTube - YouTube".
     let mut title = if display.eq_ignore_ascii_case("youtube") {
         display.to_string()
     } else {
         format!("{display} - YouTube")
     };
-    // Keep the profile visible in the taskbar while several run at once.
     if profile_id != DEFAULT_PROFILE {
-        title.push_str(&format!(" (perfil {profile_id})"));
+        title.push_str(&format!(" (profile {profile_id})"));
     }
     let _ = window.set_title(&title);
 }
 
-/// Re-apply the active tab's title to the window caption.
 fn refresh_window_title(app: &AppHandle) {
     let title = {
         let manager = app.state::<TabManager>();
@@ -946,74 +657,33 @@ fn update_title(app: &AppHandle, id: u32, title: &str) {
 }
 
 fn update_loading(app: &AppHandle, id: u32, url: &Url, finished: bool) {
-    // While a tab warms its renderer the document on screen is a throwaway, so
-    // the tab keeps its real address, title and loading state until the real
-    // page starts loading.
     let manager = app.state::<TabManager>();
     let mut reveal = false;
-    let dispatch = {
+    {
         let mut state = manager.lock();
-        let is_target = state
-            .pending
-            .get(&id)
-            .is_some_and(|entry| entry.target == *url);
-
-        if is_target {
-            // The real page is finally loading: back to normal handling, and
-            // the tab can come on screen.
-            state.pending.remove(&id);
+        if state.pending.remove(&id).is_some() {
             reveal = true;
-            false
-        } else if state.pending.contains_key(&id) {
-            // The warm-up document finished. `send_to_target` owns the
-            // `dispatched` flag, so the retry timer and this event cannot
-            // both navigate: whichever arrives second is turned away there.
-            if finished {
-                true
-            } else {
-                return;
-            }
-        } else {
-            false
         }
-    };
-    if dispatch {
-        send_to_target(app, id);
-        return;
+        if let Some(tab) = state.items.iter_mut().find(|tab| tab.id == id) {
+            tab.loading = !finished;
+            tab.started = true;
+            tab.url = url.to_string();
+        } else {
+            return;
+        }
     }
     if reveal {
         apply_active(app);
     }
-
-    let manager = app.state::<TabManager>();
-    {
-        let mut state = manager.lock();
-        let Some(tab) = state.items.iter_mut().find(|tab| tab.id == id) else {
-            return;
-        };
-        tab.loading = !finished;
-        tab.started = true;
-        tab.url = url.to_string();
-    }
     emit_state(app);
     if finished {
         save_session(app);
-        // WebView2 only records an extension id once it has loaded, so this is
-        // the earliest point the settings menu can be filled in.
-        let manager = app.state::<TabManager>();
         if manager.snapshot().extensions.is_empty() && !manager.refresh_extensions().is_empty() {
             emit_state(app);
         }
-        watch_for_extensions(app);
     }
 }
 
-/// Replace a tab's warm-up document with the real destination.
-///
-/// The pause is deliberate: the renderer exists as soon as the warm-up
-/// document is committed, but the extension host only learns about it a
-/// moment later. Navigating before that reply arrives leaves the page without
-/// content scripts, which is the whole reason for the hop.
 fn send_to_target(app: &AppHandle, id: u32) {
     let manager = app.state::<TabManager>();
     let target = {
@@ -1028,66 +698,12 @@ fn send_to_target(app: &AppHandle, id: u32) {
         entry.target.clone()
     };
 
-    let handle = app.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(warmup_delay());
-        trace(&format!("tab {id}: warm-up over, sending the real address"));
-
-        let Some(webview) = handle.get_webview(&tab_label(id)) else {
-            trace(&format!("tab {id}: closed before its first navigation"));
-            return;
-        };
-
-        // A real navigation, not `location.replace`. WebView2 only attaches
-        // the extensions' content scripts to a document the browser asked
-        // for; a navigation started from the warm-up document's own script
-        // gets none, which is the failure this hop exists to avoid. The cost
-        // is one extra back-history entry pointing at the warm-up page.
-        if let Err(error) = webview.navigate(target) {
-            trace(&format!("tab {id}: first navigation failed: {error}"));
-        }
-        // The tab stays hidden until the real page starts loading, so the
-        // warm-up document is never on screen.
-    });
+    if let Some(webview) = app.get_webview(&tab_label(id)) {
+        trace(&format!("tab {id}: navigating to {target}"));
+        let _ = webview.navigate(target);
+    }
 }
 
-/// Keep looking for extensions for a few seconds after a page load.
-///
-/// On a fresh profile the ids are written to the browser profile a moment after
-/// the first page finishes, so the attempt above can come back empty and leave
-/// the settings button hidden until the next navigation. Retrying costs nothing
-/// once the list is known.
-fn watch_for_extensions(app: &AppHandle) {
-    static PENDING: AtomicBool = AtomicBool::new(false);
-
-    let manager = app.state::<TabManager>();
-    if !manager.snapshot().extensions.is_empty() {
-        return;
-    }
-    if PENDING.swap(true, Ordering::AcqRel) {
-        return;
-    }
-
-    let handle = app.clone();
-    std::thread::spawn(move || {
-        for delay in [700u64, 1_500, 3_000, 6_000, 12_000] {
-            std::thread::sleep(std::time::Duration::from_millis(delay));
-            let manager = handle.state::<TabManager>();
-            if !manager.refresh_extensions().is_empty() {
-                emit_state(&handle);
-                break;
-            }
-        }
-        PENDING.store(false, Ordering::Release);
-    });
-}
-
-/// Build a tab's webview if it does not exist yet.
-///
-/// Tabs restored from the previous session are only reserved: the app opens
-/// with a single page loading instead of one per tab, and the rest are built
-/// the first time they are shown. Building them all at once is what stops the
-/// extension host from registering any of them.
 fn ensure_webview(app: &AppHandle, id: u32) -> bool {
     if app.get_webview(&tab_label(id)).is_some() {
         return false;
@@ -1110,11 +726,9 @@ pub fn activate_tab(app: &AppHandle, id: u32) -> Result<(), String> {
     let previous = {
         let mut state = manager.lock();
         if !state.items.iter().any(|tab| tab.id == id) {
-            return Err("aba inexistente".into());
+            return Err("tab not found".into());
         }
         if state.active == Some(id) {
-            // Already selected, but the webview may still be waiting to be
-            // built the first time.
             drop(state);
             ensure_webview(app, id);
             apply_active(app);
@@ -1125,15 +739,12 @@ pub fn activate_tab(app: &AppHandle, id: u32) -> Result<(), String> {
         previous
     };
 
-    // Switching away from a fullscreen video would otherwise leave the tab
-    // strip hidden with no way back to it.
     if FULLSCREEN.swap(false, Ordering::Relaxed) {
         if let Some(previous) = previous.and_then(|id| app.get_webview(&tab_label(id))) {
             let _ = previous.eval("document.fullscreenElement && document.exitFullscreen()");
         }
     }
 
-    // A restored tab has no webview until it is first shown.
     ensure_webview(app, id);
 
     apply_active(app);
@@ -1151,7 +762,7 @@ pub fn close_tab(app: &AppHandle, id: u32) -> Result<(), String> {
             .items
             .iter()
             .position(|tab| tab.id == id)
-            .ok_or_else(|| "aba inexistente".to_string())?;
+            .ok_or_else(|| "tab not found".to_string())?;
         state.items.remove(index);
         state.pending.remove(&id);
         let was_active = state.active == Some(id);
@@ -1179,7 +790,6 @@ pub fn close_tab(app: &AppHandle, id: u32) -> Result<(), String> {
     }
 
     if was_active {
-        // The tab that takes over may still be waiting to be built.
         if let Some(next) = manager.active_id() {
             ensure_webview(app, next);
         }
@@ -1196,7 +806,7 @@ pub fn cycle_tab(app: &AppHandle, delta: i32) -> Result<(), String> {
     let next = {
         let state = manager.lock();
         if state.items.is_empty() {
-            return Err("nenhuma aba".into());
+            return Err("no tabs".into());
         }
         let current = state
             .items
@@ -1215,7 +825,7 @@ pub fn select_index(app: &AppHandle, index: i32) -> Result<(), String> {
     let target = {
         let state = manager.lock();
         if state.items.is_empty() {
-            return Err("nenhuma aba".into());
+            return Err("no tabs".into());
         }
         let position = if index < 0 {
             state.items.len() - 1
@@ -1232,15 +842,9 @@ fn active_webview(app: &AppHandle) -> Option<Webview> {
     app.get_webview(&tab_label(id))
 }
 
-// ---------------------------------------------------------------------------
-// Session persistence
-// ---------------------------------------------------------------------------
-
 #[derive(Serialize, Deserialize, Default)]
 struct Session {
     tabs: Vec<String>,
-    /// Tab titles, so a restored tab shows its name before it is loaded.
-    /// Missing in sessions written by older builds, hence the default.
     #[serde(default)]
     titles: Vec<String>,
     #[serde(default)]
@@ -1259,9 +863,6 @@ fn save_session(app: &AppHandle) {
         return;
     };
 
-    // Take the snapshot under the lock, then resolve each tab's live URL
-    // outside it: `url()` round-trips to the main thread and must never run
-    // while another thread could be waiting on this mutex.
     let (entries, active) = {
         let state = manager.lock();
         let active = state
@@ -1277,14 +878,13 @@ fn save_session(app: &AppHandle) {
         (entries, active)
     };
 
-    // A YouTube route change is a pushState, not a navigation, so the URL
-    // stored at load time goes stale; the webview's own URL is authoritative.
     let mut tabs: Vec<String> = Vec::with_capacity(entries.len());
     let mut titles: Vec<String> = Vec::with_capacity(entries.len());
     for (id, fallback, title) in entries {
         let url = app
             .get_webview(&tab_label(id))
             .and_then(|webview| webview.url().ok())
+            .filter(|url| url.as_str() != "about:blank")
             .map(|url| url.to_string())
             .unwrap_or(fallback);
         tabs.push(url);
@@ -1305,10 +905,6 @@ fn save_session(app: &AppHandle) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Commands (called from the tab strip and from page shortcuts)
-// ---------------------------------------------------------------------------
-
 #[tauri::command]
 pub async fn tabs_new(app: AppHandle, url: Option<String>) -> Result<(), String> {
     trace("tab: new requested");
@@ -1325,7 +921,7 @@ pub async fn tabs_close_active(app: AppHandle) -> Result<(), String> {
     let id = app
         .state::<TabManager>()
         .active_id()
-        .ok_or_else(|| "nenhuma aba ativa".to_string())?;
+        .ok_or_else(|| "no active tab".to_string())?;
     close_tab(&app, id)
 }
 
@@ -1347,14 +943,10 @@ pub async fn tabs_cycle(app: AppHandle, delta: i32) -> Result<(), String> {
 #[tauri::command]
 pub async fn tabs_navigate(app: AppHandle, url: String) -> Result<(), String> {
     let target = youtube::target(&url);
-    let webview = active_webview(&app).ok_or_else(|| "nenhuma aba ativa".to_string())?;
+    let webview = active_webview(&app).ok_or_else(|| "no active tab".to_string())?;
     webview.navigate(target).map_err(|error| error.to_string())
 }
 
-/// Open an external link in the system browser, never inside a tab.
-///
-/// The page-side bridge calls this for links outside the YouTube allowlist;
-/// the shell itself stays a single-site application.
 #[tauri::command]
 pub async fn tabs_open_external(app: AppHandle, url: String) -> Result<(), String> {
     let target = Url::parse(&url).map_err(|error| error.to_string())?;
@@ -1368,13 +960,13 @@ pub async fn tabs_open_external(app: AppHandle, url: String) -> Result<(), Strin
 
 #[tauri::command]
 pub async fn tabs_reload(app: AppHandle) -> Result<(), String> {
-    let webview = active_webview(&app).ok_or_else(|| "nenhuma aba ativa".to_string())?;
+    let webview = active_webview(&app).ok_or_else(|| "no active tab".to_string())?;
     webview.reload().map_err(|error| error.to_string())
 }
 
 #[tauri::command]
 pub async fn tabs_back(app: AppHandle) -> Result<(), String> {
-    let webview = active_webview(&app).ok_or_else(|| "nenhuma aba ativa".to_string())?;
+    let webview = active_webview(&app).ok_or_else(|| "no active tab".to_string())?;
     webview
         .eval("history.back()")
         .map_err(|error| error.to_string())
@@ -1382,13 +974,12 @@ pub async fn tabs_back(app: AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn tabs_forward(app: AppHandle) -> Result<(), String> {
-    let webview = active_webview(&app).ok_or_else(|| "nenhuma aba ativa".to_string())?;
+    let webview = active_webview(&app).ok_or_else(|| "no active tab".to_string())?;
     webview
         .eval("history.forward()")
         .map_err(|error| error.to_string())
 }
 
-/// Grow the active tab over the tab strip while a video is fullscreen.
 #[tauri::command]
 pub async fn tabs_fullscreen(app: AppHandle, active: bool) -> Result<(), String> {
     FULLSCREEN.store(active, Ordering::Relaxed);
@@ -1401,37 +992,56 @@ pub async fn tabs_state(app: AppHandle) -> Result<TabsState, String> {
     Ok(app.state::<TabManager>().snapshot())
 }
 
-// ---------------------------------------------------------------------------
-// App bootstrap
-// ---------------------------------------------------------------------------
+fn prepare_session_tabs(app: &AppHandle) -> u32 {
+    let manager = app.state::<TabManager>();
+    let session_path = manager.session_path.clone();
+
+    let Some(session) = load_session(&session_path).filter(|s| !s.tabs.is_empty()) else {
+        let (id, _) = reserve_tab(app, None, true);
+        return id;
+    };
+
+    let active = session.active.min(session.tabs.len().saturating_sub(1));
+    let mut reserved = Vec::with_capacity(session.tabs.len());
+    for url in &session.tabs {
+        reserved.push(reserve_tab(app, Some(url), false).0);
+    }
+
+    let active_id = reserved.get(active).copied().unwrap_or(0);
+    {
+        let mut state = manager.lock();
+        state.active = Some(active_id);
+        for (index, tab) in state.items.iter_mut().enumerate() {
+            tab.loading = tab.id == active_id;
+            if let Some(title) = session.titles.get(index) {
+                if !title.trim().is_empty() {
+                    tab.title = title.clone();
+                }
+            }
+        }
+    }
+    active_id
+}
 
 fn create_shell(app: &AppHandle) -> tauri::Result<()> {
     trace("shell: start");
     let manager = app.state::<TabManager>();
-    let window_config = manager.config.windows.first().cloned();
 
-    let width = window_config.as_ref().map(|c| c.width).unwrap_or(1440.0);
-    let height = window_config.as_ref().map(|c| c.height).unwrap_or(900.0);
-    let title = window_config
-        .as_ref()
-        .and_then(|c| c.title.clone())
-        .unwrap_or_else(|| "YouTube".to_string());
-    // Make it obvious which profile a window belongs to when several run at once.
     let title = if manager.profile_id == DEFAULT_PROFILE {
-        title
+        "YouTube".to_string()
     } else {
-        format!("{title} (perfil {})", manager.profile_id)
+        format!("YouTube (profile {})", manager.profile_id)
     };
+
+    let active_tab_id = prepare_session_tabs(app);
 
     let window = tauri::window::WindowBuilder::new(app, WINDOW_LABEL)
         .title(title)
-        .inner_size(width, height)
+        .inner_size(DEFAULT_WIDTH, DEFAULT_HEIGHT)
         .min_inner_size(560.0, 400.0)
         .resizable(true)
         .center()
         .visible(false)
-        // Painted while the first webview is still being built, so the wait
-        // reads as the app starting rather than as a white flash.
         .background_color(tauri::window::Color(15, 15, 15, 255))
         .build()?;
 
@@ -1441,24 +1051,26 @@ fn create_shell(app: &AppHandle) -> tauri::Result<()> {
 
     let size = window.inner_size()?;
 
-    // Show the frame before building any webview. `show` is handled by the
-    // event loop, so the webviews have to be built after the setup hook returns;
-    // otherwise the first WebView2 (which loads every unpacked extension) keeps
-    // the window invisible for tens of seconds and the launch looks broken.
     let _ = window.show();
     let _ = window.set_focus();
+    refresh_window_title(app);
     trace("shell: shown");
 
     let shell = app.clone();
     tauri::async_runtime::spawn(async move {
         create_strip(&shell, size);
-        restore_tabs(&shell);
+        let handle = shell.clone();
+        std::thread::spawn(move || {
+            ensure_webview(&handle, active_tab_id);
+            layout(&handle);
+            emit_state(&handle);
+            trace("tabs: restored");
+        });
     });
 
     Ok(())
 }
 
-/// Build the tab strip, the first webview of the window.
 fn create_strip(app: &AppHandle, size: PhysicalSize<u32>) {
     let Some(window) = app.get_window(WINDOW_LABEL) else {
         return;
@@ -1480,84 +1092,21 @@ fn create_strip(app: &AppHandle, size: PhysicalSize<u32>) {
     }
 }
 
-/// Reopen the tabs saved by the previous run, or the home page on a first run.
-///
-/// The session only reserves the tabs; the page the user was on is built right
-/// away and the others follow the first time they are shown. This runs off the
-/// main thread so a slow first page cannot hold up the window.
-fn restore_tabs(app: &AppHandle) {
-    let handle = app.clone();
-    std::thread::spawn(move || restore_tabs_now(&handle));
-}
-
-fn restore_tabs_now(app: &AppHandle) {
-    let manager = app.state::<TabManager>();
-    let session_path = manager.session_path.clone();
-
-    let Some(session) = load_session(&session_path).filter(|session| !session.tabs.is_empty())
-    else {
-        // open_tab activates this one itself; nothing else to select.
-        let _ = open_tab(app, None, true);
-        layout(app);
-        emit_state(app);
-        trace("tabs: restored");
-        return;
-    };
-
-    let active = session.active.min(session.tabs.len().saturating_sub(1));
-
-    // Reserve every tab first so the strip is complete straight away, then
-    // build only the one the user was on. The rest are built when they are
-    // first shown: building them all here is what makes the extension host
-    // skip most of them, and it also keeps startup to a single page load.
-    let mut reserved: Vec<u32> = Vec::with_capacity(session.tabs.len());
-    for url in &session.tabs {
-        reserved.push(reserve_tab(app, Some(url), false).0);
-    }
-    {
-        let mut state = manager.lock();
-        for (index, tab) in state.items.iter_mut().enumerate() {
-            tab.loading = false;
-            // A tab that is not loaded yet has no title of its own, so the one
-            // saved with the session is what the strip shows until then.
-            if let Some(title) = session.titles.get(index) {
-                if !title.trim().is_empty() {
-                    tab.title = title.clone();
-                }
-            }
-        }
-    }
-    emit_state(app);
-
-    if let Some(id) = reserved.get(active) {
-        let _ = activate_tab(app, *id);
-    }
-
-    layout(app);
-    emit_state(app);
-    trace("tabs: restored");
-}
-
-pub fn run_tabbed(pake_config: PakeConfig, tauri_config: Config) {
-    // Each profile is its own app as far as Windows is concerned: a distinct
-    // AppUserModelID groups its taskbar button separately, so two profiles can
-    // sit side by side instead of stacking under one icon.
+pub fn run_tabbed() {
     let profile_id = requested_profile();
     let identifier = match profile_id {
-        Some(id) => format!("{}.profile{id}", tauri_config.identifier),
-        None => tauri_config.identifier.clone(),
+        Some(id) => format!("{APP_IDENTIFIER}.profile{id}"),
+        None => APP_IDENTIFIER.to_string(),
     };
 
     #[cfg(windows)]
-    crate::util::set_app_user_model_id(&identifier);
+    set_app_user_model_id(&identifier);
 
     let context = tauri::generate_context!();
 
     let mut builder = tauri::Builder::default();
 
     if profile_id.is_none() {
-        // Named profiles are meant to run concurrently, so the single-instance
-        // guard only covers the default one.
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(window) = app.get_window(WINDOW_LABEL) {
                 let _ = window.unminimize();
@@ -1567,8 +1116,6 @@ pub fn run_tabbed(pake_config: PakeConfig, tauri_config: Config) {
         }));
     }
 
-    // Window geometry is remembered per profile, otherwise two profiles would
-    // open on top of each other at the same coordinates.
     let active_profile = profile_id.unwrap_or(DEFAULT_PROFILE);
     let window_state = tauri_plugin_window_state::Builder::default()
         .with_state_flags(
@@ -1598,7 +1145,6 @@ pub fn run_tabbed(pake_config: PakeConfig, tauri_config: Config) {
             tabs_open_external,
         ])
         .on_menu_event(|app, event| {
-            // Native popup menu built on demand by `tabs_extension_menu`.
             let id = event.id().0.clone();
             let Some(index) = id
                 .strip_prefix(EXTENSION_MENU_PREFIX)
@@ -1613,41 +1159,38 @@ pub fn run_tabbed(pake_config: PakeConfig, tauri_config: Config) {
         })
         .setup(move |app| {
             trace("setup: start");
-            // Grant IPC to the configured site origin. Without this the page
-            // bridge cannot reach the tab commands, so shortcuts and
-            // middle-click tabs would silently do nothing.
-            if let Some(capability) = pake_config.remote_capability()? {
-                app.add_capability(capability)?;
-            }
-
             let handle = app.app_handle().clone();
             let app_root = handle.path().app_data_dir().ok();
             let profile = resolve_profile(app_root.as_deref());
+            let data_dir = profile.webview_dir();
 
-            // Settings pages have to be embeddable before the browser reads
-            // the manifests, so this runs ahead of `create_shell`.
-            extensions::prepare(&profile.extensions);
-            extensions::log_discovered(&profile.extensions);
+            let plan = if extensions_disabled() {
+                ProfileExtensionPlan::default()
+            } else {
+                extensions::prepare_and_inspect(&profile.extensions, &data_dir)
+            };
+
             trace(&format!(
                 "setup: extensions folder {}",
                 profile.extensions.display()
             ));
 
-            let data_dir = profile.webview_dir();
+            let initial_extensions = if extensions_disabled() {
+                Vec::new()
+            } else {
+                extensions::settings_pages(&data_dir, &profile.extensions)
+            };
+
             let session_path = Some(profile.session_path());
-            // One folder beside the executable serves every profile.
-            let extensions_dir = Some(profile.extensions.clone());
-            // Filters are read once here, not per tab: a replaced JSON takes
-            // effect on the next launch for every tab in the window.
-            let filter_script = filters::initialization_script(&profile.base);
+            let extensions_dir = Some(profile.extensions);
 
             app.manage(TabManager::new(
-                pake_config.clone(),
                 data_dir,
                 session_path,
                 extensions_dir,
+                plan,
                 profile.id,
-                filter_script,
+                initial_extensions,
             ));
 
             create_shell(&handle)?;

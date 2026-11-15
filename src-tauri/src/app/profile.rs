@@ -1,24 +1,4 @@
 //! Per-profile storage layout.
-//!
-//! A profile owns everything that should stay isolated between sessions: the
-//! WebView2 user data folder (cookies, cache, site data) and the tab session.
-//!
-//! ```text
-//! <base>/profile1          default profile
-//! <base>/profile2          --profile2
-//! ```
-//!
-//! Every profile is a numbered folder, including the default one, so the layout
-//! is uniform: `--profile1` and no flag mean the same thing.
-//!
-//! `<base>` is the executable's own directory when a `portable` marker file
-//! sits next to it, and the OS application data directory otherwise. That keeps
-//! a portable copy self-contained on a USB stick while leaving an installed
-//! copy behaving like a normal Windows app.
-//!
-//! Extensions are the one thing that is *not* per profile: they live in a single
-//! `extensions` folder beside the executable so an extension installed once is
-//! available to every profile.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -32,30 +12,18 @@ pub const DEFAULT_PROFILE: u32 = 1;
 /// Presence of any of these next to the executable switches to portable mode.
 const PORTABLE_MARKERS: [&str; 2] = ["portable", "portable.txt"];
 
-/// Folders that used to live directly in `<base>` before profiles were
-/// mandatory. They are moved into `profile1` on first run.
-///
-/// `extensions` is deliberately absent: it is shared by every profile and lives
-/// in exactly this folder now, so moving it would drag tens of megabytes into a
-/// profile and copy them back out again.
+/// Folders that used to live directly in `<base>` before profiles were mandatory.
 const LEGACY_ENTRIES: [&str; 2] = ["webview", "session.json"];
 
 #[derive(Debug, Clone)]
 pub struct Profile {
-    /// Always in `1..=MAX_PROFILE`; `DEFAULT_PROFILE` when no flag was given.
     pub id: u32,
     pub dir: PathBuf,
-    /// Directory holding `profileN` folders. Shared by every profile.
     pub base: PathBuf,
-    /// Unpacked extensions, shared by every profile. Sits next to the
-    /// executable, with the app data folder as a fallback when that location is
-    /// not writable (a machine-wide install under Program Files, say).
     pub extensions: PathBuf,
 }
 
 impl Profile {
-    /// WebView2 user data folder. Cookies and site storage live here, so each
-    /// profile gets its own login session.
     pub fn webview_dir(&self) -> PathBuf {
         self.dir.join("webview")
     }
@@ -64,8 +32,6 @@ impl Profile {
         self.dir.join("session.json")
     }
 
-    /// Adopt extensions left inside a profile by an older build, then drop the
-    /// now-empty folder so only one copy exists.
     fn adopt_legacy_extensions(&self) {
         let legacy = self.dir.join("extensions");
         if legacy == self.extensions || !legacy.is_dir() {
@@ -89,13 +55,9 @@ impl Profile {
     }
 }
 
-/// Resolve the profile requested on the command line.
-///
-/// `app_data` is the OS application data directory, used as the base for an
-/// installed copy.
 pub fn resolve(app_data: Option<&Path>) -> Profile {
     let exe_dir = exe_dir();
-    let portable = is_portable();
+    let portable = is_portable_in(exe_dir.as_deref());
 
     let base = if portable {
         exe_dir.clone().unwrap_or_else(|| PathBuf::from("."))
@@ -109,7 +71,7 @@ pub fn resolve(app_data: Option<&Path>) -> Profile {
     let dir = base.join(format!("profile{id}"));
 
     let extensions =
-        requested_extensions_dir().unwrap_or_else(|| extensions_dir(exe_dir.as_deref(), &base));
+        requested_extensions_dir().unwrap_or_else(|| resolve_extensions_dir(exe_dir.as_deref(), &base));
 
     let profile = Profile {
         id,
@@ -118,9 +80,6 @@ pub fn resolve(app_data: Option<&Path>) -> Profile {
         extensions,
     };
 
-    // Before profiles were mandatory the data sat directly in the base folder.
-    // Move it once so an existing login and session survive the change. A
-    // profile that already holds a browser profile is left alone.
     if id == DEFAULT_PROFILE && !profile.webview_dir().exists() {
         migrate_legacy(&profile.base, &profile.dir);
     }
@@ -131,9 +90,6 @@ pub fn resolve(app_data: Option<&Path>) -> Profile {
     profile
 }
 
-/// An explicit extension folder, from `YTPAKE_EXTENSIONS_DIR` or
-/// `--extensions-dir <path>`. Useful for testing a downloaded extension
-/// without copying it into the installation directory.
 fn requested_extensions_dir() -> Option<PathBuf> {
     if let Ok(raw) = std::env::var("YTPAKE_EXTENSIONS_DIR") {
         let trimmed = raw.trim();
@@ -144,8 +100,6 @@ fn requested_extensions_dir() -> Option<PathBuf> {
     extensions_dir_from_args(std::env::args().skip(1))
 }
 
-/// Pure argument parser, so the flag can be unit tested without touching the
-/// process command line.
 fn extensions_dir_from_args<I>(args: I) -> Option<PathBuf>
 where
     I: IntoIterator<Item = String>,
@@ -169,31 +123,49 @@ where
     None
 }
 
-/// `<exe dir>/extensions`, falling back to `<base>/extensions` when the
-/// executable sits somewhere the user cannot write to.
-fn extensions_dir(exe_dir: Option<&Path>, base: &Path) -> PathBuf {
+/// Resolve `.\extensions` beside the executable first, falling back to working
+/// directory `.\extensions` (or `..\extensions` in workspace builds) when
+/// running from a build output folder, and finally `<base>\extensions`.
+fn resolve_extensions_dir(exe_dir: Option<&Path>, base: &Path) -> PathBuf {
     let beside_exe = exe_dir.map(|dir| dir.join("extensions"));
+    if let Some(ref candidate) = beside_exe {
+        if has_manifest_subdir(candidate) {
+            return candidate.clone();
+        }
+    }
+
+    if let Ok(cwd) = std::env::current_dir() {
+        let cwd_ext = cwd.join("extensions");
+        if has_manifest_subdir(&cwd_ext) {
+            return cwd_ext;
+        }
+        if let Some(parent) = cwd.parent() {
+            let parent_ext = parent.join("extensions");
+            if has_manifest_subdir(&parent_ext) {
+                return parent_ext;
+            }
+        }
+    }
+
     if let Some(candidate) = beside_exe {
-        if fs::create_dir_all(&candidate).is_ok() && is_writable(&candidate) {
+        if candidate.is_dir() || fs::create_dir_all(&candidate).is_ok() {
             return candidate;
         }
     }
     base.join("extensions")
 }
 
-/// A directory that exists is not necessarily one this user may write to.
-fn is_writable(directory: &Path) -> bool {
-    let probe = directory.join(".pake-write-test");
-    match fs::write(&probe, b"") {
-        Ok(()) => {
-            let _ = fs::remove_file(&probe);
-            true
-        }
-        Err(_) => false,
-    }
+fn has_manifest_subdir(folder: &Path) -> bool {
+    fs::read_dir(folder)
+        .map(|entries| {
+            entries.flatten().any(|entry| {
+                entry.file_type().is_ok_and(|ft| ft.is_dir())
+                    && entry.path().join("manifest.json").is_file()
+            })
+        })
+        .unwrap_or(false)
 }
 
-/// Move `<base>/{webview,extensions,session.json}` into `<base>/profile1`.
 fn migrate_legacy(base: &Path, target: &Path) {
     if !LEGACY_ENTRIES.iter().any(|name| base.join(name).exists()) {
         return;
@@ -211,7 +183,6 @@ fn migrate_legacy(base: &Path, target: &Path) {
         if to.exists() {
             continue;
         }
-        // rename is atomic within a volume; a copy keeps it working otherwise.
         if fs::rename(&from, &to).is_err() {
             let _ = copy_tree(&from, &to);
             let _ = fs::remove_dir_all(&from);
@@ -241,10 +212,8 @@ fn exe_dir() -> Option<PathBuf> {
         .and_then(|path| path.parent().map(Path::to_path_buf))
 }
 
-/// True when a `portable` marker file sits next to the executable, which moves
-/// every profile beside the executable instead of into the user's app data.
-pub fn is_portable() -> bool {
-    exe_dir()
+fn is_portable_in(exe_dir: Option<&Path>) -> bool {
+    exe_dir
         .map(|dir| {
             PORTABLE_MARKERS
                 .iter()
@@ -253,31 +222,13 @@ pub fn is_portable() -> bool {
         .unwrap_or(false)
 }
 
-/// True when the command line asked for extensions to be skipped, which is the
-/// quick way out if one of them breaks page loads.
 pub fn extensions_disabled() -> bool {
     std::env::args()
         .skip(1)
         .any(|arg| arg == "--no-extensions" || arg == "--no-ext")
 }
 
-/// The built-in blocker is on by default; `--no-adblock` turns it off without
-/// uninstalling any extension. Useful for comparing behaviour or for sites
-/// that change their markup in a way the filters do not cover yet.
-pub fn adblock_enabled() -> bool {
-    !std::env::args()
-        .skip(1)
-        .any(|arg| arg == "--no-adblock" || arg == "--disable-adblock")
-}
-
-/// The `--profileN` value from the command line, if any.
 pub fn requested() -> Option<u32> {
-    requested_profile()
-}
-
-/// Scan the command line for `--profileN`, `-profileN`, `--profile=N` or
-/// `--profile N`. Anything else is ignored so normal Pake flags still work.
-fn requested_profile() -> Option<u32> {
     let mut args = std::env::args().skip(1);
 
     while let Some(arg) = args.next() {
@@ -288,7 +239,6 @@ fn requested_profile() -> Option<u32> {
         let rest = rest.trim_start_matches(['=', ' ', ':']);
 
         if rest.is_empty() {
-            // `--profile 3`
             if let Some(id) = args.next().as_deref().and_then(parse_id) {
                 return Some(id);
             }

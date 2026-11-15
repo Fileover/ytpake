@@ -1,21 +1,4 @@
-#[cfg(target_os = "macos")]
-pub mod auth;
-#[cfg(any(target_os = "linux", test))]
-pub mod color_scheme;
-pub mod config;
-#[cfg(target_os = "windows")]
-pub mod download;
 pub mod extensions;
-pub mod filters;
-pub mod invoke;
-#[cfg(target_os = "macos")]
-pub mod menu;
-pub mod navigation;
-pub mod notification;
 pub mod profile;
-pub mod setup;
-#[cfg(target_os = "macos")]
-pub mod tab_bar;
 pub mod tabs;
-pub mod window;
 pub mod youtube;

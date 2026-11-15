@@ -1,9 +1,7 @@
 //! YouTube-only navigation policy.
 //!
-//! This fork builds one application: YouTube. The upstream Pake CLI is kept as
-//! build tooling, but the shipped shell must never become a general-purpose
-//! browser. Every address a tab can be pointed at, and every navigation a page
-//! can start, passes through this module first.
+//! Every address a tab can be pointed at, and every navigation a page can
+//! start, passes through this module first.
 //!
 //! The allowlist is deliberately small: YouTube's own origins, the short-link
 //! domain, and the Google hosts the sign-in flow redirects through. Anything

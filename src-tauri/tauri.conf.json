@@ -21,10 +21,6 @@
       "png/youtube_32.ico",
       "png/youtube_512.png"
     ],
-    "resources": {
-      "../extensions/": "extensions/",
-      "../filters/": "filters/"
-    },
     "windows": {
       "nsis": {
         "installMode": "currentUser"

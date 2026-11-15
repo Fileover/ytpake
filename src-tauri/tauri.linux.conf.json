@@ -1,7 +1,0 @@
-{
-  "bundle": {
-    "icon": ["png/youtube_512.png"],
-    "active": true,
-    "targets": ["deb", "appimage"]
-  }
-}

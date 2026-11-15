@@ -216,7 +216,7 @@
 
     const close = document.createElement("button");
     close.textContent = "\u00d7";
-    close.title = "Fechar (Esc)";
+    close.title = "Close (Esc)";
     close.style.cssText = [
       "position:absolute",
       "top:8px",
